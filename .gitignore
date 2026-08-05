@@ -1,0 +1,45 @@
+build/
+*.o
+*.so
+*.bpf.o
+affinity-run
+affinityctl
+affinitygraph-tests
+interposer-test
+
+# --- 编译产物 (C/C++) ---
+*.o
+*.so
+*.a
+*.out
+build/
+cmake-build-*/
+CMakeFiles/
+
+# --- BPF 编译产物 ---
+*.bpf.o
+*.skel.h
+.vmlinux.h
+
+# --- 实验日志和诊断产物 (你前文提到的实验目录) ---
+experiments/
+logs/
+*.log
+*.jsonl
+*.csv
+
+# --- Python 虚拟环境和缓存 (你的 prism-sampler) ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# --- 操作系统和 IDE 隐藏文件 ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

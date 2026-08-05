@@ -1,0 +1,27 @@
+[runtime]
+mode = "observe"
+sample_interval_seconds = 1
+graph_horizon_seconds = 60
+solve_interval_seconds = 10
+minimum_confidence = 0.8
+proposal_confirmations = 3
+minimum_dwell_seconds = 60
+maximum_migrated_active_threads_ratio = 0.25
+collector_failure_restore_seconds = 30
+log_directory = "/var/log/affinitygraph"
+socket_path = "/run/affinitygraph/control.sock"
+
+[resources]
+cpus = "0-127"
+calibration_path = "/etc/affinitygraph/calibration"
+
+[collector]
+required = false
+
+[calibration]
+# Frozen ClickHouse scales from 20260723 gate2 fixed-v2. Other databases must
+# replace the ID and all three scales with a reviewed offline calibration.
+id = "clickhouse-gate2-fixed-v2"
+activity_log_p95 = 2.4138804290562152
+sync_log_p95 = 2.5591179487485345
+share_log_p95 = 0.00894730347830295

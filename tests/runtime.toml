@@ -1,0 +1,25 @@
+[runtime]
+mode = "observe"
+sample_interval_seconds = 1
+graph_horizon_seconds = 2
+solve_interval_seconds = 1
+minimum_confidence = 0.0
+proposal_confirmations = 1
+minimum_dwell_seconds = 0
+maximum_migrated_active_threads_ratio = 0.25
+collector_failure_restore_seconds = 2
+log_directory = "/tmp/affinitygraph-test"
+socket_path = "/tmp/affinitygraph-test.sock"
+
+[resources]
+cpus = "0-15"
+calibration_path = ""
+
+[collector]
+required = false
+
+[calibration]
+id = "test"
+activity_log_p95 = 1.0
+sync_log_p95 = 1.0
+share_log_p95 = 1.0
