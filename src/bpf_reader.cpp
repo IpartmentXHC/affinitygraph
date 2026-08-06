@@ -1,13 +1,13 @@
-#include "affinitygraph/core.hpp"
+#include "affinitygraph/runtime.hpp"
 #include "affinitygraph/bpf_events.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <sys/mman.h>
+#include <time.h>
 #include <linux/bpf.h>
 #include <memory>
 #include <sys/syscall.h>
@@ -17,20 +17,21 @@ namespace affinitygraph {
 
 class BpfRingReader {
 public:
-  static std::shared_ptr<BpfRingReader> from_environment() {
-    const char *text = getenv("AFFINITYGRAPH_BPF_EVENTS_FD");
-    if (!text || !*text) return {};
-    char *end = nullptr;
-    long fd = std::strtol(text, &end, 10);
-    if (!end || *end || fd < 0) throw std::runtime_error("invalid AFFINITYGRAPH_BPF_EVENTS_FD");
-    int health_fd = -1;
-    if (const char *health = getenv("AFFINITYGRAPH_BPF_HEALTH_FD")) health_fd = std::atoi(health);
-    return std::shared_ptr<BpfRingReader>(new BpfRingReader(static_cast<int>(fd), health_fd));
-  }
-
-  explicit BpfRingReader(int fd, int health_fd) : fd_(fd), health_fd_(health_fd), page_(static_cast<size_t>(sysconf(_SC_PAGESIZE))) {
-    constexpr size_t capacity = 1U << 20;
-    capacity_ = capacity;
+  explicit BpfRingReader(int fd, int health_fd, int futex_aggregates_fd)
+      : fd_(fd), health_fd_(health_fd), futex_aggregates_fd_(futex_aggregates_fd),
+        page_(static_cast<size_t>(sysconf(_SC_PAGESIZE))) {
+    bpf_map_info info{};
+    union bpf_attr attr{};
+    uint32_t info_length = sizeof(info);
+    attr.info.bpf_fd = fd_;
+    attr.info.info_len = info_length;
+    attr.info.info = reinterpret_cast<uint64_t>(&info);
+    if (syscall(SYS_bpf, BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) != 0 ||
+        info.type != BPF_MAP_TYPE_RINGBUF || !info.max_entries)
+      throw std::runtime_error("cannot query BPF ring buffer capacity: " +
+                               std::string(std::strerror(errno)));
+    capacity_ = info.max_entries;
+    stats_.capacity_bytes = capacity_;
     consumer_map_ = mmap(nullptr, page_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
     producer_map_ = mmap(nullptr, page_ + 2 * capacity_, PROT_READ, MAP_SHARED, fd_, static_cast<off_t>(page_));
     if (consumer_map_ == MAP_FAILED || producer_map_ == MAP_FAILED) {
@@ -45,7 +46,7 @@ public:
     munmap(producer_map_, page_ + 2 * capacity_);
   }
 
-  std::vector<RelationObservation> drain() {
+  std::vector<affinitygraph_bpf_event> drain() {
     constexpr uint32_t busy = 1U << 31;
     constexpr uint32_t discard = 1U << 30;
     auto *consumer = static_cast<uint64_t *>(consumer_map_);
@@ -53,7 +54,12 @@ public:
     auto *data = static_cast<unsigned char *>(producer_map_) + page_;
     uint64_t position = std::atomic_ref<uint64_t>(*consumer).load(std::memory_order_acquire);
     uint64_t end = std::atomic_ref<uint64_t>(*producer).load(std::memory_order_acquire);
-    std::map<std::pair<int, int>, RelationObservation> grouped;
+    uint64_t started = boot_ns();
+    stats_.occupancy_bytes = end - position;
+    stats_.max_occupancy_bytes = std::max(stats_.max_occupancy_bytes,
+                                         stats_.occupancy_bytes);
+    std::vector<affinitygraph_bpf_event> result;
+    uint64_t batch_max_lag = 0;
     while (position < end) {
       auto *length_ptr = reinterpret_cast<uint32_t *>(data + (position & (capacity_ - 1)));
       uint32_t length = std::atomic_ref<uint32_t>(*length_ptr).load(std::memory_order_acquire);
@@ -62,47 +68,106 @@ public:
       if (!(length & discard) && payload_length >= sizeof(affinitygraph_bpf_event)) {
         affinitygraph_bpf_event event{};
         std::memcpy(&event, length_ptr + 2, sizeof(event));
-        if ((event.kind == AFFINITYGRAPH_FUTEX || event.kind == AFFINITYGRAPH_VFS) && event.tid != event.peer_tid) {
-          auto key = std::pair{static_cast<int>(event.tid), static_cast<int>(event.peer_tid)};
-          auto &item = grouped[key];
-          item.from_tid = key.first;
-          item.to_tid = key.second;
-          item.timestamp_ns = std::max(item.timestamp_ns, event.timestamp_ns);
-          if (event.kind == AFFINITYGRAPH_FUTEX) item.futex_per_second += 1.0;
-          else item.shared_vfs_seconds += static_cast<double>(event.value_ns) / 1e9;
-          item.active_overlap = 1.0;
-        }
+        if (started >= event.timestamp_ns)
+          batch_max_lag = std::max(batch_max_lag, started - event.timestamp_ns);
+        result.push_back(event);
       }
       position += (static_cast<uint64_t>(payload_length) + 8 + 7) & ~7ULL;
     }
     std::atomic_ref<uint64_t>(*consumer).store(position, std::memory_order_release);
-    std::vector<RelationObservation> result;
-    for (auto &[key, observation] : grouped) result.push_back(observation);
+    stats_.occupancy_bytes = end - position;
+    stats_.drain_calls++;
+    stats_.events_consumed += result.size();
+    stats_.last_batch_events = result.size();
+    stats_.max_batch_events = std::max<uint64_t>(stats_.max_batch_events, result.size());
+    stats_.last_drain_ns = boot_ns() - started;
+    stats_.max_drain_ns = std::max(stats_.max_drain_ns, stats_.last_drain_ns);
+    stats_.last_max_lag_ns = batch_max_lag;
+    stats_.max_lag_ns = std::max(stats_.max_lag_ns, batch_max_lag);
     return result;
   }
 
-  affinitygraph_bpf_health health() const {
-    affinitygraph_bpf_health result{};
-    if (health_fd_ < 0) return result;
+  BpfHealthSnapshot health() const {
+    BpfHealthSnapshot snapshot;
+    if (health_fd_ < 0) {
+      snapshot.error = EBADF;
+      return snapshot;
+    }
     uint32_t key = 0;
     union bpf_attr attr{};
     attr.map_fd = health_fd_;
     attr.key = reinterpret_cast<uint64_t>(&key);
-    attr.value = reinterpret_cast<uint64_t>(&result);
-    if (syscall(SYS_bpf, BPF_MAP_LOOKUP_ELEM, &attr, sizeof(attr)) != 0) return {};
+    attr.value = reinterpret_cast<uint64_t>(&snapshot.counters);
+    if (syscall(SYS_bpf, BPF_MAP_LOOKUP_ELEM, &attr, sizeof(attr)) != 0) {
+      snapshot.error = errno;
+      return snapshot;
+    }
+    snapshot.valid = true;
+    return snapshot;
+  }
+
+  std::vector<affinitygraph_bpf_event> drain_futex_aggregates() {
+    std::vector<affinitygraph_bpf_event> result;
+    if (futex_aggregates_fd_ < 0) return result;
+    for (size_t index = 0; index < 65536; ++index) {
+      affinitygraph_futex_key key{};
+      union bpf_attr next_attr{};
+      next_attr.map_fd = futex_aggregates_fd_;
+      next_attr.key = 0;
+      next_attr.next_key = reinterpret_cast<uint64_t>(&key);
+      if (syscall(SYS_bpf, BPF_MAP_GET_NEXT_KEY, &next_attr, sizeof(next_attr)) != 0)
+        break;
+      affinitygraph_futex_value value{};
+      union bpf_attr take_attr{};
+      take_attr.map_fd = futex_aggregates_fd_;
+      take_attr.key = reinterpret_cast<uint64_t>(&key);
+      take_attr.value = reinterpret_cast<uint64_t>(&value);
+      if (syscall(SYS_bpf, BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+                  &take_attr, sizeof(take_attr)) != 0)
+        continue;
+      affinitygraph_bpf_event event{};
+      event.kind = AFFINITYGRAPH_FUTEX;
+      event.tgid = key.tgid;
+      event.tid = key.tid;
+      event.peer_tid = key.peer_tid;
+      event.timestamp_ns = value.last_timestamp_ns;
+      event.start_time_ns = key.start_time_ns;
+      event.peer_start_time_ns = key.peer_start_time_ns;
+      event.value_ns = value.count;
+      result.push_back(event);
+      stats_.futex_aggregate_records++;
+      stats_.futex_handoffs += value.count;
+    }
     return result;
   }
 
+  BpfReaderStats stats() const { return stats_; }
+
 private:
+  static uint64_t boot_ns() {
+    timespec value{};
+    clock_gettime(CLOCK_BOOTTIME, &value);
+    return static_cast<uint64_t>(value.tv_sec) * 1000000000ULL + value.tv_nsec;
+  }
   int fd_;
   int health_fd_;
+  int futex_aggregates_fd_;
   size_t page_;
   size_t capacity_;
   void *consumer_map_ = MAP_FAILED;
   void *producer_map_ = MAP_FAILED;
+  BpfReaderStats stats_;
 };
 
-std::shared_ptr<BpfRingReader> make_bpf_reader() { return BpfRingReader::from_environment(); }
-std::vector<RelationObservation> drain_bpf_reader(BpfRingReader &reader) { return reader.drain(); }
-affinitygraph_bpf_health bpf_reader_health(BpfRingReader &reader) { return reader.health(); }
+std::shared_ptr<BpfRingReader> make_bpf_reader(int events_fd, int health_fd,
+                                               int futex_aggregates_fd) {
+  if (events_fd < 0) return {};
+  return std::make_shared<BpfRingReader>(events_fd, health_fd, futex_aggregates_fd);
+}
+std::vector<affinitygraph_bpf_event> drain_bpf_events(BpfRingReader &reader) { return reader.drain(); }
+std::vector<affinitygraph_bpf_event> drain_bpf_futex_aggregates(BpfRingReader &reader) {
+  return reader.drain_futex_aggregates();
+}
+BpfHealthSnapshot bpf_reader_health(BpfRingReader &reader) { return reader.health(); }
+BpfReaderStats bpf_reader_stats(BpfRingReader &reader) { return reader.stats(); }
 } // namespace affinitygraph

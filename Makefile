@@ -1,17 +1,19 @@
 CXX ?= g++
 CC ?= gcc
+CLANG ?= clang
 CXXFLAGS ?= -O2 -g -std=c++20 -Wall -Wextra -Wpedantic
 CPPFLAGS += -Iinclude
 LDFLAGS ?=
 BUILD := build
+VMLINUX_H ?= $(BUILD)/bpf/vmlinux.h
 
 CORE_SOURCES := src/config.cpp src/topology.cpp src/collector.cpp src/graph.cpp src/solver.cpp src/actuator.cpp
 CORE_OBJECTS := $(CORE_SOURCES:%.cpp=$(BUILD)/%.o)
-RUNTIME_OBJECTS := $(BUILD)/src/runtime.o $(BUILD)/src/preload.o $(BUILD)/src/bpf_reader.o
+RUNTIME_OBJECTS := $(BUILD)/src/runtime.o $(BUILD)/src/bpf_reader.o
 
 .PHONY: all test clean install bpf
 
-all: $(BUILD)/libaffinitygraph.so $(BUILD)/affinity-run $(BUILD)/affinityctl $(BUILD)/affinitygraph-tests $(BUILD)/interposer-test
+all: $(BUILD)/affinity-run $(BUILD)/affinityctl $(BUILD)/affinitygraph-tests $(BUILD)/supervisor-test $(BUILD)/bpf-lifecycle-test
 
 $(BUILD)/%.o: %.cpp
 	@mkdir -p $(@D)
@@ -20,26 +22,30 @@ $(BUILD)/%.o: %.cpp
 $(BUILD)/affinitygraph-tests: tests/core_test.cpp $(CORE_OBJECTS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $^ $(LDFLAGS) -pthread -ldl -o $@
 
-$(BUILD)/libaffinitygraph.so: $(CORE_OBJECTS) $(RUNTIME_OBJECTS)
-	$(CXX) -shared $^ $(LDFLAGS) -pthread -ldl -o $@
-
-$(BUILD)/interposer-test: tests/interposer_test.cpp
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -pthread -o $@
-
-$(BUILD)/affinity-run: src/affinity_run.cpp $(BUILD)/src/config.o $(BUILD)/src/topology.o
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $^ -o $@
+$(BUILD)/affinity-run: src/affinity_run.cpp $(CORE_OBJECTS) $(RUNTIME_OBJECTS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $^ $(LDFLAGS) -pthread -ldl -o $@
 
 $(BUILD)/affinityctl: src/affinityctl.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
 
-bpf:
-	@mkdir -p $(BUILD)/bpf
-	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $(BUILD)/bpf/vmlinux.h
-	clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 -I$(BUILD)/bpf -Iinclude -c bpf/affinitygraph.bpf.c -o $(BUILD)/affinitygraph.bpf.o
+$(BUILD)/supervisor-test: tests/supervisor_test.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -pthread -o $@
+
+$(BUILD)/bpf-lifecycle-test: tests/bpf_lifecycle_test.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -pthread -o $@
+
+bpf: $(VMLINUX_H)
+	@mkdir -p $(BUILD)
+	$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_arm64 -I$(dir $(VMLINUX_H)) -Iinclude -c bpf/affinitygraph.bpf.c -o $(BUILD)/affinitygraph.bpf.o
+
+$(BUILD)/bpf/vmlinux.h:
+	@mkdir -p $(@D)
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
 
 test: all
 	$(BUILD)/affinitygraph-tests
-	LD_PRELOAD=$(abspath $(BUILD)/libaffinitygraph.so) $(BUILD)/interposer-test
+	$(BUILD)/affinity-run run --config tests/runtime.toml -- $(BUILD)/supervisor-test
+	sh tests/supervisor_test.sh
 
 clean:
 	rm -rf $(BUILD)
@@ -47,7 +53,6 @@ clean:
 install: all
 	install -D -m 0755 $(BUILD)/affinity-run $(DESTDIR)/usr/sbin/affinity-run
 	install -D -m 0755 $(BUILD)/affinityctl $(DESTDIR)/usr/bin/affinityctl
-	install -D -m 0755 $(BUILD)/libaffinitygraph.so $(DESTDIR)/usr/lib/libaffinitygraph.so
 	install -D -m 0644 config/affinitygraph.toml $(DESTDIR)/etc/affinitygraph/affinitygraph.toml
 	install -D -m 0644 calibration/kunpeng920/hardware-node-edges.csv $(DESTDIR)/etc/affinitygraph/calibration/hardware-node-edges.csv
 	install -D -m 0644 calibration/kunpeng920/README.md $(DESTDIR)/etc/affinitygraph/calibration/README.md

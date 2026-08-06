@@ -8,6 +8,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -30,6 +31,7 @@ struct Config {
   double maximum_migrated_active_threads_ratio = 0.25;
   int collector_failure_restore_seconds = 30;
   bool bpf_required = false;
+  bool pthread_uprobe = true;
   std::string relationship_calibration_id = "clickhouse-gate2-fixed-v2";
   double activity_log_p95 = 2.4138804290562152;
   double sync_log_p95 = 2.5591179487485345;
@@ -77,6 +79,9 @@ struct ThreadSample {
   char state = '?';
   std::string comm;
   std::vector<int> allowed_cpus;
+  int parent_tid = -1;
+  uintptr_t start_routine = 0;
+  std::string start_symbol;
 };
 
 class ProcCollector {
@@ -92,6 +97,8 @@ private:
 struct RelationObservation {
   int from_tid = -1;
   int to_tid = -1;
+  uint64_t from_starttime = 0;
+  uint64_t to_starttime = 0;
   uint64_t timestamp_ns = 0;
   double futex_per_second = 0;
   double shared_vfs_seconds = 0;
@@ -131,7 +138,8 @@ public:
   std::vector<RelationEdge> edges() const;
   static std::string normalize_group(const std::string &comm,
                                      uintptr_t start_routine = 0,
-                                     int parent_tid = -1);
+                                     int parent_tid = -1,
+                                     const std::string &start_symbol = {});
 
 private:
   int horizon_seconds_;
@@ -151,6 +159,13 @@ struct SolveOptions {
   double maximum_migrated_active_threads_ratio = 0.25;
   double active_threshold = 0.05;
 };
+
+using ActiveCohort = std::set<std::tuple<int, int, uint64_t>>;
+ActiveCohort active_cohort(const std::vector<ThreadDemand> &threads,
+                           double active_threshold = 0.05);
+bool active_cohort_continues(const ActiveCohort &previous,
+                             const ActiveCohort &current,
+                             double maximum_growth_ratio = 0.05);
 
 class Solver {
 public:
@@ -175,9 +190,22 @@ public:
 
 struct ApplyResult {
   bool success = false;
+  size_t requested = 0;
   size_t applied = 0;
+  size_t committed = 0;
   size_t vanished = 0;
+  size_t rolled_back = 0;
+  bool rollback_success = true;
   int error = 0;
+};
+
+struct RestoreResult {
+  size_t requested = 0;
+  size_t restored = 0;
+  size_t vanished = 0;
+  size_t failed = 0;
+
+  bool success() const { return failed == 0; }
 };
 
 class Actuator {
@@ -185,12 +213,16 @@ public:
   explicit Actuator(AffinityBackend &backend);
   ApplyResult apply(const Placement &placement,
                     const std::set<int> &live_tids);
-  bool restore_all();
+  RestoreResult restore_all();
+  void note_policy_action(int tid);
   void note_application_mask(int tid, const std::vector<int> &cpus);
+  void note_inherited_mask(int tid, int parent_tid,
+                           const std::vector<int> &observed_cpus);
 
 private:
   AffinityBackend &backend_;
   std::map<int, std::vector<int>> restore_masks_;
+  std::set<int> acted_tids_;
 };
 
 uint64_t monotonic_ns();

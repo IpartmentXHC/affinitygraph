@@ -16,7 +16,8 @@ cpus = "0-127"
 calibration_path = "/etc/affinitygraph/calibration"
 
 [collector]
-required = false
+required = true
+pthread_uprobe = true
 
 [calibration]
 # Frozen ClickHouse scales from 20260723 gate2 fixed-v2. Other databases must

@@ -1,0 +1,26 @@
+[runtime]
+mode = "active"
+sample_interval_seconds = 1
+graph_horizon_seconds = 6
+solve_interval_seconds = 2
+minimum_confidence = 0.5
+proposal_confirmations = 2
+minimum_dwell_seconds = 1
+maximum_migrated_active_threads_ratio = 1.0
+collector_failure_restore_seconds = 5
+log_directory = "/tmp/affinitygraph-bpf-active-test"
+socket_path = "/tmp/affinitygraph-bpf-active-test.sock"
+
+[resources]
+cpus = "0-15"
+calibration_path = "calibration/kunpeng920"
+
+[collector]
+required = true
+pthread_uprobe = true
+
+[calibration]
+id = "clickhouse-gate2-fixed-v2"
+activity_log_p95 = 2.4138804290562152
+sync_log_p95 = 2.5591179487485345
+share_log_p95 = 0.00894730347830295

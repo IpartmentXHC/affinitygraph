@@ -4,8 +4,32 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 
 namespace affinitygraph {
+
+ActiveCohort active_cohort(const std::vector<ThreadDemand> &threads,
+                           double active_threshold) {
+  ActiveCohort active;
+  for (const auto &thread : threads)
+    if (thread.demand >= active_threshold)
+      active.emplace(thread.identity.tgid, thread.identity.tid,
+                     thread.identity.starttime);
+  return active;
+}
+
+bool active_cohort_continues(const ActiveCohort &previous,
+                             const ActiveCohort &current,
+                             double maximum_growth_ratio) {
+  if (previous == current) return !current.empty();
+  if (previous.size() < 20 || current.size() <= previous.size() ||
+      !std::includes(current.begin(), current.end(),
+                     previous.begin(), previous.end())) return false;
+  size_t additions = current.size() - previous.size();
+  size_t allowance = static_cast<size_t>(
+      std::ceil(previous.size() * maximum_growth_ratio));
+  return additions <= allowance;
+}
 
 Placement Solver::solve(const HardwareGraph &hardware,
                         const std::vector<ThreadDemand> &threads,

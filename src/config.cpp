@@ -104,6 +104,7 @@ Config load_config(const std::string &path) {
     else if (key == "runtime.maximum_migrated_active_threads_ratio") c.maximum_migrated_active_threads_ratio = std::stod(value);
     else if (key == "runtime.collector_failure_restore_seconds") c.collector_failure_restore_seconds = std::stoi(value);
     else if (key == "collector.required") c.bpf_required = boolean(value);
+    else if (key == "collector.pthread_uprobe") c.pthread_uprobe = boolean(value);
     else if (key == "calibration.id") c.relationship_calibration_id = unquote(value);
     else if (key == "calibration.activity_log_p95") c.activity_log_p95 = std::stod(value);
     else if (key == "calibration.sync_log_p95") c.sync_log_p95 = std::stod(value);

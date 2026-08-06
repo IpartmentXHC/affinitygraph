@@ -17,6 +17,7 @@ calibration_path = ""
 
 [collector]
 required = false
+pthread_uprobe = true
 
 [calibration]
 id = "test"

@@ -47,11 +47,13 @@ void GraphWindow::observe_threads(const std::vector<ThreadSample> &samples) {
 
 void GraphWindow::observe_relation(const RelationObservation &observation) { relations_.push_back(observation); }
 
-std::string GraphWindow::normalize_group(const std::string &comm, uintptr_t start_routine, int parent_tid) {
+std::string GraphWindow::normalize_group(const std::string &comm, uintptr_t start_routine,
+                                         int parent_tid, const std::string &start_symbol) {
   std::string normalized = std::regex_replace(comm, std::regex("([_-]?[0-9]+)+$"), "");
   if (normalized.empty()) normalized = "unnamed";
   // Symbol and lineage disambiguate identically named pools without depending on product names.
-  return normalized + "@" + std::to_string(start_routine) + ":" + std::to_string(parent_tid);
+  std::string routine = start_symbol.empty() ? std::to_string(start_routine) : start_symbol;
+  return normalized + "@" + routine + ":" + std::to_string(parent_tid);
 }
 
 std::vector<ThreadDemand> GraphWindow::demands() const {
@@ -73,7 +75,9 @@ std::vector<ThreadDemand> GraphWindow::demands() const {
     }
     double coverage = std::min(1.0, static_cast<double>(pressure.size()) / std::max(1, horizon_seconds_ - 1));
     const auto &last = history.back();
-    result.push_back({last.identity, normalize_group(last.comm), ewma, coverage, last.recent_cpu});
+    result.push_back({last.identity, normalize_group(last.comm, last.start_routine,
+                                                     last.parent_tid, last.start_symbol),
+                      ewma, coverage, last.recent_cpu});
   }
   std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) { return a.identity.tid < b.identity.tid; });
   return result;

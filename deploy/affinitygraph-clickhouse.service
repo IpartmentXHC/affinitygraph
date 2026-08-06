@@ -12,13 +12,14 @@ RuntimeDirectoryMode=0750
 LogsDirectory=affinitygraph
 LogsDirectoryMode=0750
 ExecStartPre=/usr/bin/chown clickhouse:clickhouse /run/affinitygraph /var/log/affinitygraph
-ExecStart=/usr/sbin/affinity-run run --config /etc/affinitygraph/affinitygraph.toml --library /usr/lib/libaffinitygraph.so --bpf-object /usr/lib/affinitygraph/affinitygraph.bpf.o --user clickhouse -- /usr/bin/clickhouse-server --config-file=/etc/clickhouse-server/config.xml
+ExecStart=/usr/sbin/affinity-run run --config /etc/affinitygraph/affinitygraph.toml --bpf-object /usr/lib/affinitygraph/affinitygraph.bpf.o --user clickhouse -- /usr/bin/clickhouse-server --config-file=/etc/clickhouse-server/config.xml
 ExecStop=/usr/bin/affinityctl pause --socket /run/affinitygraph/control.sock
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=120s
 LimitMEMLOCK=infinity
 NoNewPrivileges=true
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
