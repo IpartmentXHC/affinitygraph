@@ -275,6 +275,7 @@ NumaDomainProposal NumaDomainSolver::propose(
       select_family_edges(cross, options.family_edges_per_family);
   proposal.selected_family_pair_count = selected_cross.size();
   std::set<std::pair<std::string, std::string>> evaluated_merges;
+  std::set<std::pair<std::string, std::string>> qualifying_merges;
   std::vector<std::pair<std::string, std::string>> confirmed_seeds;
   for (const auto &pair : selected_cross) {
     const double weight = cross.at(pair);
@@ -289,6 +290,13 @@ NumaDomainProposal NumaDomainSolver::propose(
     double denominator = std::min(internal[pair.first], internal[pair.second]);
     bool qualifies = endpoints_eligible && denominator > 0 &&
                      weight / denominator >= options.domain_merge_ratio;
+    if (qualifies) {
+      qualifying_merges.insert(pair);
+      // pair 证据偶尔会因 heavy-hitter 边界或短窗口 demand 波动消失。保留与
+      // 完整 plan 确认等长的 acquisition grace，只用于阻止 singleton 抢先
+      // commit；merge confirmation 本身仍严格要求连续窗口，不降低稳定门槛。
+      merge_pending_grace_[pair] = options.plan_confirmations;
+    }
     int confirmation = qualifies ? ++merge_confirmations_[pair] : 0;
     if (!qualifies) merge_confirmations_[pair] = 0;
     FamilyPairMetric pair_metric;
@@ -315,13 +323,24 @@ NumaDomainProposal NumaDomainSolver::propose(
   }
   for (auto &[pair, confirmation] : merge_confirmations_)
     if (!evaluated_merges.contains(pair)) confirmation = 0;
+  for (auto &[pair, grace] : merge_pending_grace_) {
+    if (!qualifying_merges.contains(pair) && grace > 0) --grace;
+    const auto confirmation = merge_confirmations_[pair];
+    if (grace > 0 && confirmation < options.domain_stability_confirmations &&
+        metrics.contains(pair.first) && metrics.contains(pair.second)) {
+      metrics[pair.first].cross_pending = true;
+      metrics[pair.second].cross_pending = true;
+    }
+  }
 
   std::set<std::string> anchors;
   // 输出 family 集合是两条证据路径的并集。cohesive_anchor 需要 S_g/P_g，
   // cross_seed 则只依赖双方绝对证据和稳定 X_gh；因此 self-containment 不是
-  // 全局硬门槛，外部-only family 又不会被误纳入。
+  // 全局硬门槛，外部-only family 又不会被误纳入。若强跨组关系正在确认，
+  // cohesive anchor 暂不单独输出；pair 一旦稳定便由 cross_seed 原子输出双方。
   for (auto &[name, metric] : metrics) {
-    metric.anchor = metric.cohesive_anchor || metric.cross_seed;
+    metric.anchor = metric.cross_seed ||
+                    (metric.cohesive_anchor && !metric.cross_pending);
     if (metric.anchor) anchors.insert(name);
     proposal.families.push_back(metric);
   }
@@ -445,9 +464,102 @@ NumaDomainProposal NumaDomainSolver::propose(
     proposal.domains.push_back(std::move(domain));
   }
 
+  // 已提交 domain 的 dwell 约束作用于完整 family domain，而不仅是 node 数量。
+  // workload phase 切换时关系边和 demand 会短暂消失；若此时把联合 domain
+  // 降成 singleton，再在下一阶段重建，会制造一次无意义的 restore/bind 抖动。
+  // 只要成员仍在线且应用 mask 仍兼容，在 dwell 内保留原 domain 和 node mask。
+  for (const auto &committed : domains_) {
+    const auto changed = last_changed_ns_.find(committed.id);
+    if (changed == last_changed_ns_.end() ||
+        now_ns - changed->second >= options.minimum_dwell_ns)
+      continue;
+    // 已确认候选若完整包含当前 family（例如 singleton 升级为联合 domain），
+    // 允许升级；dwell 只阻止丢失 family 的降级或拆分。
+    if (std::any_of(
+            proposal.domains.begin(), proposal.domains.end(),
+            [&](const auto &candidate) {
+              return std::all_of(
+                  committed.families.begin(), committed.families.end(),
+                  [&](const auto &family) {
+                    return std::find(candidate.families.begin(),
+                                     candidate.families.end(), family) !=
+                           candidate.families.end();
+                  });
+            }))
+      continue;
+
+    std::vector<ThreadDemand> members;
+    NumaDomain held = committed;
+    held.tids.clear();
+    held.demand = 0;
+    for (const auto &family : held.families) {
+      auto observed = by_family.find(family);
+      if (observed == by_family.end()) continue;
+      for (const auto &member : observed->second) {
+        members.push_back(member);
+        held.tids.push_back(member.identity.tid);
+        held.demand += member.demand;
+      }
+    }
+    if (members.empty()) continue;
+
+    // 同一 family 只能属于一个 domain。dwell 内的已提交联合 domain 优先于
+    // 当前窗口因边缺失而产生的重叠 singleton proposal。
+    std::set<std::string> held_families(held.families.begin(), held.families.end());
+    proposal.domains.erase(
+        std::remove_if(
+            proposal.domains.begin(), proposal.domains.end(),
+            [&](const auto &candidate) {
+              return std::any_of(
+                  candidate.families.begin(), candidate.families.end(),
+                  [&](const auto &family) { return held_families.contains(family); });
+            }),
+        proposal.domains.end());
+
+    std::sort(held.tids.begin(), held.tids.end());
+    held.previous_nodes = held.target_nodes;
+    held.node_decision = "held_domain_dwell";
+    held.online_cpu_count = held.target_mask.size();
+    held.capacity_limit = held.online_cpu_count * options.capacity_ratio;
+    held.capacity_headroom = held.capacity_limit - held.demand;
+    held.initial_migrations = 0;
+    if (held.tids.size() > options.maximum_threads_per_domain) {
+      held.valid = false;
+      held.invalid_reason = "maximum_threads_per_domain_exceeded";
+      proposal.valid = false;
+      proposal.invalid_reason = held.id + ":" + held.invalid_reason;
+    }
+    proposal.domains.push_back(std::move(held));
+  }
+
   std::sort(proposal.domains.begin(), proposal.domains.end(),
             [](const auto &a, const auto &b) { return a.id < b.id; });
-  if (!proposal.valid) proposal.delta.tid_to_mask.clear();
+  // dwell 可能替换重叠的候选 domain，因此从最终 domain 集合统一重建 mask，
+  // 防止被替换 singleton 的 TID 残留在 actuator 输入中。
+  proposal.delta.tid_to_mask.clear();
+  if (proposal.valid) {
+    for (auto &domain : proposal.domains) {
+      if (!domain.valid) continue;
+      for (int tid : domain.tids) {
+        auto thread = by_tid.find(tid);
+        if (thread == by_tid.end()) continue;
+        auto allowed = allowed_masks.find(tid);
+        auto target = allowed == allowed_masks.end()
+                          ? domain.target_mask
+                          : intersect_masks(domain.target_mask, allowed->second);
+        if (target.empty()) {
+          domain.valid = false;
+          domain.invalid_reason = "empty_application_mask_intersection";
+          proposal.valid = false;
+          proposal.invalid_reason = domain.id + ":" + domain.invalid_reason;
+          proposal.delta.tid_to_mask.clear();
+          break;
+        }
+        proposal.delta.tid_to_mask[tid] = std::move(target);
+      }
+      if (!proposal.valid) break;
+    }
+  }
   proposal.planned_masks = proposal.delta.tid_to_mask;
   std::set<int> next_tids;
   for (const auto &[tid, _] : proposal.planned_masks) next_tids.insert(tid);

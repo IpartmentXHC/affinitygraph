@@ -90,6 +90,11 @@ void test_identity_reuse_and_demand() {
   require(GraphWindow::normalize_group("worker_1", 0x1000, 7, "pool_start") ==
               GraphWindow::normalize_group("worker_2", 0x2000, 99, "pool_start"),
           "resolved symbol stabilizes family across addresses and creators");
+  require(GraphWindow::normalize_group("Pipe_normal [wo") ==
+              GraphWindow::normalize_group("Pipe_normal") &&
+              GraphWindow::normalize_group("Pipe_normal [worker]") ==
+                  GraphWindow::normalize_group("Pipe_normal"),
+          "truncated bracket role does not split a placement family");
 }
 
 void test_relationship_score() {
@@ -357,6 +362,128 @@ void test_numa_domain_clickhouse_negative_control() {
               !thread_pool->anchor,
           "ThreadPool fails containment and external-only handlers cannot seed it");
   solver.discard(proposal);
+}
+
+void test_numa_domain_pending_merge_suppresses_singleton() {
+  auto h = hardware();
+  std::vector<ThreadDemand> threads{
+      {{1, 1, 1}, "family-a", 0.6, 1, 0},
+      {{1, 2, 2}, "family-a", 0.6, 1, 1},
+      {{1, 3, 3}, "family-b", 0.6, 1, 2},
+      {{1, 4, 4}, "family-b", 0.6, 1, 3},
+  };
+  std::vector<RelationEdge> edges{
+      {1, 2, 0, 0, 0, 1, 10},
+      {3, 4, 0, 0, 0, 1, 1.5},
+      {1, 3, 0, 0, 0, 1, 8},
+  };
+  NumaDomainOptions options;
+  options.family_stability_confirmations = 1;
+  options.domain_stability_confirmations = 3;
+  options.plan_confirmations = 1;
+  NumaDomainSolver solver;
+
+  for (int window = 1; window <= 2; ++window) {
+    auto pending = solver.propose(
+        h, threads, edges, {}, options,
+        static_cast<uint64_t>(window) * 10000000000ULL);
+    const auto family_a = std::find_if(
+        pending.families.begin(), pending.families.end(),
+        [](const auto &family) { return family.name == "family-a"; });
+    require(family_a != pending.families.end() &&
+                family_a->cohesive_anchor && family_a->cross_pending &&
+                !family_a->anchor && pending.domains.empty() && !pending.ready,
+            "pending strong pair suppresses an intermediate singleton domain");
+    solver.discard(pending);
+  }
+
+  auto confirmed = solver.propose(h, threads, edges, {}, options, 30000000000ULL);
+  require(confirmed.ready && confirmed.domains.size() == 1 &&
+              confirmed.domains[0].families ==
+                  std::vector<std::string>({"family-a", "family-b"}),
+          "confirmed pair becomes one atomic domain without singleton churn");
+  solver.discard(confirmed);
+}
+
+void test_numa_domain_dwell_holds_transient_relation_gap() {
+  auto h = hardware();
+  std::vector<ThreadDemand> threads{
+      {{1, 1, 1}, "family-a", 0.6, 1, 0},
+      {{1, 2, 2}, "family-a", 0.6, 1, 1},
+      {{1, 3, 3}, "family-b", 0.6, 1, 2},
+      {{1, 4, 4}, "family-b", 0.6, 1, 3},
+  };
+  std::vector<RelationEdge> edges{
+      {1, 2, 0, 0, 0, 1, 10},
+      {3, 4, 0, 0, 0, 1, 2},
+      {1, 3, 0, 0, 0, 1, 8},
+  };
+  NumaDomainOptions options;
+  options.family_stability_confirmations = 1;
+  options.domain_stability_confirmations = 1;
+  options.plan_confirmations = 1;
+  options.minimum_dwell_ns = 100;
+  NumaDomainSolver solver;
+
+  auto initial = solver.propose(h, threads, edges, {}, options, 10);
+  require(initial.ready && initial.domains.size() == 1,
+          "dwell fixture creates a joint domain");
+  solver.commit(initial, 10);
+
+  auto idle_threads = threads;
+  for (auto &thread : idle_threads) thread.demand = 0;
+  auto held = solver.propose(h, idle_threads, {}, {}, options, 50);
+  require(held.ready && held.domains.size() == 1 &&
+              held.domains[0].families ==
+                  std::vector<std::string>({"family-a", "family-b"}) &&
+              held.domains[0].node_decision == "held_domain_dwell" &&
+              held.planned_masks.size() == 4 && held.actions.empty() &&
+              held.released_tids.empty(),
+          "transient relation gap keeps the committed domain during dwell");
+  solver.discard(held);
+
+  auto expired = solver.propose(h, idle_threads, {}, {}, options, 111);
+  require(expired.ready && expired.domains.empty() &&
+              expired.released_tids == std::set<int>({1, 2, 3, 4}),
+          "domain can release after dwell expires with no surviving evidence");
+  solver.discard(expired);
+}
+
+void test_numa_domain_dwell_allows_superset_merge() {
+  auto h = hardware();
+  NumaDomainOptions options;
+  options.family_stability_confirmations = 1;
+  options.domain_stability_confirmations = 1;
+  options.plan_confirmations = 1;
+  options.minimum_dwell_ns = 100;
+  NumaDomainSolver solver;
+  std::vector<ThreadDemand> singleton_threads{
+      {{1, 1, 1}, "family-a", 0.6, 1, 0},
+      {{1, 2, 2}, "family-a", 0.6, 1, 1},
+  };
+  auto singleton = solver.propose(
+      h, singleton_threads, {{1, 2, 0, 0, 0, 1, 10}}, {}, options, 10);
+  require(singleton.ready && singleton.domains.size() == 1,
+          "superset fixture creates a singleton domain");
+  solver.commit(singleton, 10);
+
+  std::vector<ThreadDemand> pair_threads{
+      singleton_threads[0], singleton_threads[1],
+      {{1, 3, 3}, "family-b", 0.6, 1, 2},
+      {{1, 4, 4}, "family-b", 0.6, 1, 3},
+  };
+  std::vector<RelationEdge> pair_edges{
+      {1, 2, 0, 0, 0, 1, 10},
+      {3, 4, 0, 0, 0, 1, 2},
+      {1, 3, 0, 0, 0, 1, 8},
+  };
+  auto merged = solver.propose(h, pair_threads, pair_edges, {}, options, 20);
+  require(merged.ready && merged.domains.size() == 1 &&
+              merged.domains[0].families ==
+                  std::vector<std::string>({"family-a", "family-b"}) &&
+              merged.domains[0].node_decision != "held_domain_dwell",
+          "domain dwell permits a confirmed superset merge");
+  solver.discard(merged);
 }
 
 void test_numa_domain_aggregates_before_family_pruning() {
@@ -1018,6 +1145,9 @@ int main() {
     test_transactional_rollback();
     test_numa_domain_family_selection_and_merge();
     test_numa_domain_clickhouse_negative_control();
+    test_numa_domain_pending_merge_suppresses_singleton();
+    test_numa_domain_dwell_holds_transient_relation_gap();
+    test_numa_domain_dwell_allows_superset_merge();
     test_numa_domain_aggregates_before_family_pruning();
     test_numa_domain_capacity_atomicity_and_envelope();
     test_incremental_initial_node_plan();

@@ -113,7 +113,13 @@ std::string GraphWindow::normalize_group(const std::string &comm, uintptr_t star
   // placement family 只由稳定名称和创建入口组成。末尾序号会随线程重建变化，
   // parent lineage 适合做身份追踪但不应拆分同一 worker pool，因此都不进入
   // family key。解析到符号时优先使用符号，避免 ASLR 地址跨进程变化。
-  std::string normalized = std::regex_replace(comm, std::regex("([_-]?[0-9]+)+$"), "");
+  // pthread 名称最多只有 15 字节，Doris 一类运行时会得到
+  // "Pipe_normal [wo" 这样的截断名称。方括号部分是角色说明，不是 pool
+  // 身份；在截断点之前去掉它，保证离线 oracle 与线上 family key 一致。
+  std::string normalized =
+      std::regex_replace(comm, std::regex(R"(\s+\[[^\]]*\]?$)"), "");
+  normalized =
+      std::regex_replace(normalized, std::regex("([_-]?[0-9]+)+$"), "");
   if (normalized.empty()) normalized = "unnamed";
   std::string routine = start_symbol.empty() ? std::to_string(start_routine) : start_symbol;
   return normalized + "@" + routine;

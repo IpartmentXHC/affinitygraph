@@ -311,6 +311,10 @@ struct FamilyMetric {
   int confirmation = 0;
   int seed_confirmation = 0;
   bool cohesive_anchor = false;
+  // 已出现满足阈值、但尚未完成稳定确认的跨 family 关系。此时暂缓把
+  // cohesive anchor 作为 singleton domain 输出，避免先绑定单组、随后释放
+  // 并改绑联合 domain 的初始化抖动。
+  bool cross_pending = false;
   bool cross_seed = false;
   bool anchor = false;
 };
@@ -426,6 +430,7 @@ private:
   uint64_t generation_ = 0;
   std::map<std::string, int> family_confirmations_;
   std::map<std::pair<std::string, std::string>, int> merge_confirmations_;
+  std::map<std::pair<std::string, std::string>, int> merge_pending_grace_;
   int global_plan_confirmation_ = 0;
   std::map<std::string, int> expand_confirmations_;
   std::map<std::string, int> shrink_confirmations_;

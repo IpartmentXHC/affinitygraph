@@ -106,6 +106,8 @@ std::string family_metrics_json(const std::vector<FamilyMetric> &families) {
         << ",\"seed_confirmation\":" << family.seed_confirmation
         << ",\"cohesive_anchor\":"
         << (family.cohesive_anchor ? "true" : "false")
+        << ",\"cross_pending\":"
+        << (family.cross_pending ? "true" : "false")
         << ",\"cross_seed\":" << (family.cross_seed ? "true" : "false")
         << ",\"anchor\":" << (family.anchor ? "true" : "false") << '}';
   }
@@ -726,7 +728,9 @@ std::string Runtime::status_json() const {
       << ",\"planned_threads\":"
       << (config_.solver == "numa-domain-v1" ? current_masks_.size()
                                                : current_plan_.size())
-      << ",\"active_cohort_threads\":" << active_cohort_.size()
+      << ",\"active_cohort_threads\":"
+      << (config_.solver == "numa-domain-v1" ? current_masks_.size()
+                                               : active_cohort_.size())
       << ",\"selector_ready\":" << (selector_ready_ ? "true" : "false")
       << ",\"policy_armed\":"
       << (config_.mode == Mode::Active && !paused_ && selector_ready_ &&
@@ -740,7 +744,7 @@ std::string Runtime::status_json() const {
       << ",\"active_effective\":"
       << (config_.mode == Mode::Active && !paused_ && selector_ready_ &&
                   (config_.solver == "numa-domain-v1"
-                       ? (current_masks_.empty() || domain_solver_.effective())
+                       ? (!current_masks_.empty() && domain_solver_.effective())
                        : ((active_cohort_.empty() && current_plan_.empty() &&
                            solver_.pinned_threads() == 0) || solver_.effective())) &&
                   (!bpf_reader_ || (bpf_health_.valid && bpf_window_ready_ &&
@@ -752,7 +756,9 @@ std::string Runtime::status_json() const {
       << '"' << ",\"placement_generation\":"
       << (config_.solver == "numa-domain-v1" ? domain_solver_.generation()
                                                : solver_.generation())
-      << ",\"pinned_threads\":" << solver_.pinned_threads()
+      << ",\"pinned_threads\":"
+      << (config_.solver == "numa-domain-v1" ? current_masks_.size()
+                                               : solver_.pinned_threads())
       << ",\"action_requested\":" << action_requested_
       << ",\"action_committed\":" << action_committed_
       << ",\"action_vanished\":" << action_vanished_
@@ -1078,7 +1084,9 @@ void Runtime::solve_numa_domains(
         "\",\"complete\":true,\"outcome\":\"invalid_domain_unrestricted\"");
     return;
   }
-  selector_ready_ = true;
+  // selector_ready 表示已经存在可执行/已生效的完整 plan，而不是仅表示一次
+  // solve 成功返回。否则空 domain 会被上层误认为 active-ready。
+  selector_ready_ = proposal.ready || domain_solver_.effective();
   if (!proposal.ready) {
     domain_solver_.discard(proposal);
     log("solve_window_end", "\"window_id\":\"" + window_id +

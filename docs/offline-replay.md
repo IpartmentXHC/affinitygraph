@@ -51,3 +51,9 @@ families, thread count, demand, capacity headroom, node decision, target nodes,
 and solve time, plus sequence solve-time P95. This tool is also read-only and
 links no runtime, BPF reader, collector, actuator, control socket, or affinity
 backend.
+
+Exact domain replay requires every planned window's `relation_edge_summary` to
+report `truncated=false`. If runtime logging retained only a top subset of TID
+edges, the tool fails closed with the first incomplete `window_id`; replaying
+that subset could change family aggregates and produce a selector result that
+never occurred online.

@@ -70,7 +70,7 @@ BPF gate 不通过时仍会输出该事件，随后产生 `evaluated=false` 的
 记录 solver 的完整可解释输出：
 
 - 输入 family/pair 数、聚合后 top-K pair 数
-- cohesive eligible/anchor、cross-seed family 数
+- cohesive eligible/anchor、cross-pending/cross-seed family 状态
 - qualified/confirmed pair 数
 - domain、受管 family/thread、planned mask、继承、释放和迁移数量
 - `family_metrics`：每个 family 的原始指标、四个 gate 和确认状态
@@ -84,7 +84,14 @@ BPF gate 不通过时仍会输出该事件，随后产生 `evaluated=false` 的
 - `stable`：无状态最优解与历史 node 一致
 - `held_existing`：候选 node 变化但策略保持历史 node
 - `held_expand_pending` / `held_shrink_pending`：等待确认或 dwell
+- `held_domain_dwell`：关系或 demand 短时消失，但已提交 family domain 仍在
+  300 秒最小 dwell 内；保持原 node mask，避免阶段切换时释放后重绑
 - `expanded` / `shrunk`：扩缩容条件已确认
+
+`cross_pending=true` 表示 family 已出现满足绝对门槛的强跨组候选，但 pair
+尚未完成连续三个窗口确认。pending 期间 cohesive anchor 不会抢先形成
+singleton domain；候选短暂消失时，只保留与完整 plan 确认等长的 acquisition
+grace，pair confirmation 仍会归零，因此不会降低关系稳定门槛。
 
 ### `actuator_input` / `actuator_output`
 
@@ -117,7 +124,7 @@ jq -c 'select(.type=="selector_output") |
   {window_id:$w,name,demand,internal_relation,self_containment,
    relative_internal,demand_eligible,internal_relation_eligible,
    self_containment_eligible,relative_internal_eligible,
-   cohesive_eligible,cohesive_anchor,cross_seed}' runtime.jsonl
+   cohesive_eligible,cohesive_anchor,cross_pending,cross_seed}' runtime.jsonl
 ```
 
 查看跨组 seed 的建立过程：
@@ -144,6 +151,8 @@ jq -c 'select(.type=="selector_output") |
 - family 聚合先于 heavy-hitter 剪枝。
 - `S_g/P_g` 是 cohesive 特征，不是 cross seed 的统一硬门槛。
 - cross seed 双方必须满足 demand 和绝对组内关系门槛。
+- pending cross seed 暂缓 singleton；首次 active placement 必须是非空且完整
+  确认的 domain，空计划不能报告 `active_effective=true`。
 - domain 成员是完整 family；超限整域无约束，不做部分绑定。
 - 输出是完整 NUMA-node mask，不生成稳态 CPU move/swap。
 - plan 不调用 affinity；active 必须事务执行并在退出时 100% restore。

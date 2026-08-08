@@ -24,6 +24,7 @@ struct ReplayFrame {
   std::string window_id;
   uint64_t timestamp_ns = 0;
   bool planned = false;
+  bool relation_input_complete = true;
   std::vector<ThreadDemand> threads;
   std::vector<RelationEdge> edges;
   std::map<int, std::vector<int>> allowed_masks;
@@ -108,6 +109,9 @@ void read_runtime_log(const std::string &path, HardwareGraph &hardware,
       thread.current_cpu = item.get<int>("current_cpu");
       frame.threads.push_back(thread);
       frame.allowed_masks[thread.identity.tid] = read_int_array(item, "allowed_cpus");
+    } else if (type == "relation_edge_summary") {
+      auto &frame = frame_for(item.get<std::string>("window_id"));
+      frame.relation_input_complete = !item.get("truncated", false);
     } else if (type == "relation_edge") {
       auto &frame = frame_for(item.get<std::string>("window_id"));
       RelationEdge edge;
@@ -136,6 +140,13 @@ void read_runtime_log(const std::string &path, HardwareGraph &hardware,
                frames.end());
   if (hardware.cpus.empty()) throw std::runtime_error("runtime log has no topology");
   if (frames.empty()) throw std::runtime_error("runtime log has no NUMA domain plans");
+  const auto incomplete = std::find_if(
+      frames.begin(), frames.end(),
+      [](const auto &frame) { return !frame.relation_input_complete; });
+  if (incomplete != frames.end())
+    throw std::runtime_error(
+        "runtime log truncates relation edges for window " +
+        incomplete->window_id + "; exact selector replay is invalid");
 }
 
 NumaDomainOptions domain_options(const Config &config) {
@@ -203,6 +214,7 @@ bool same_results(const std::vector<FrameResult> &left,
       const auto &b = right[index].families[family];
       if (a.name != b.name || a.anchor != b.anchor ||
           a.cohesive_anchor != b.cohesive_anchor || a.cross_seed != b.cross_seed ||
+          a.cross_pending != b.cross_pending ||
           a.confirmation != b.confirmation ||
           a.seed_confirmation != b.seed_confirmation)
         return false;
@@ -261,6 +273,8 @@ void write_result(const std::string &path, const std::vector<FrameResult> &frame
       first = false;
       out << "{\"name\":\"" << json_escape(family.name)
           << "\",\"cohesive\":" << (family.cohesive_anchor ? "true" : "false")
+          << ",\"cross_pending\":"
+          << (family.cross_pending ? "true" : "false")
           << ",\"cross_seed\":" << (family.cross_seed ? "true" : "false")
           << '}';
     }
