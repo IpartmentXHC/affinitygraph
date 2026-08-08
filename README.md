@@ -27,3 +27,6 @@ capacity headroom; Linux schedules freely within that mask. The previous
 `incremental-hotspot-v1` singleton policy remains available for replay.
 Observe never solves, plan advances only shadow state, and active commits only
 transactionally verified mask deltas.
+
+Selector 模块到源文件的映射、输入输出字段和快速日志查询见
+[`docs/selector-modules.md`](docs/selector-modules.md)。

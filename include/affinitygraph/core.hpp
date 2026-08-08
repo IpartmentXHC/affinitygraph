@@ -300,11 +300,35 @@ struct FamilyMetric {
   double external_relation = 0;
   double self_containment = 0;
   double relative_internal = 0;
+  // 以下 gate 字段只用于解释 selector 决策，不参与额外打分。把每个门槛
+  // 单独暴露后，可以从日志直接判断 family 是卡在 demand、绝对关系，还是
+  // S_g/P_g，而不必离线重新计算浮点比较。
+  bool demand_eligible = false;
+  bool internal_relation_eligible = false;
+  bool self_containment_eligible = false;
+  bool relative_internal_eligible = false;
+  bool cohesive_eligible = false;
   int confirmation = 0;
   int seed_confirmation = 0;
   bool cohesive_anchor = false;
   bool cross_seed = false;
   bool anchor = false;
+};
+
+// family 聚合完成后的一条跨组候选边。这里只记录被 deterministic top-K
+// 选中的 pair，因此日志规模受 family_edges_per_family 限制。merge_ratio
+// 对应 X_gh / min(I_g, I_h)。绝对组内证据不足时 denominator 仍会记录，
+// 但 endpoints_eligible/qualifies 为 false。
+struct FamilyPairMetric {
+  std::string left;
+  std::string right;
+  double cross_relation = 0;
+  double denominator = 0;
+  double merge_ratio = 0;
+  bool endpoints_eligible = false;
+  bool qualifies = false;
+  int confirmation = 0;
+  bool confirmed = false;
 };
 
 struct NumaDomain {
@@ -314,6 +338,18 @@ struct NumaDomain {
   std::vector<int> target_nodes;
   std::vector<int> target_mask;
   double demand = 0;
+  // node planner 的可解释输出。capacity_limit = online_cpu_count *
+  // capacity_ratio，capacity_headroom = capacity_limit - demand。
+  std::vector<int> previous_nodes;
+  size_t online_cpu_count = 0;
+  double capacity_limit = 0;
+  double capacity_headroom = 0;
+  double relation_latency = 0;
+  double background_demand = 0;
+  int initial_migrations = 0;
+  int expand_confirmation = 0;
+  int shrink_confirmation = 0;
+  std::string node_decision;
   int confirmation = 0;
   bool valid = true;
   std::string invalid_reason;
@@ -352,9 +388,15 @@ struct NumaDomainProposal {
   std::map<int, std::vector<int>> planned_masks;
   std::set<int> inherited_tids;
   std::vector<FamilyMetric> families;
+  std::vector<FamilyPairMetric> family_pairs;
   std::vector<NumaDomain> domains;
   std::vector<NumaDomainAction> actions;
   std::set<int> released_tids;
+  size_t input_family_count = 0;
+  size_t input_cross_family_pair_count = 0;
+  size_t selected_family_pair_count = 0;
+  double total_demand = 0;
+  double total_relation = 0;
   bool ready = false;
   bool valid = true;
   std::string invalid_reason;

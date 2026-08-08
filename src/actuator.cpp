@@ -39,6 +39,10 @@ void Actuator::note_inherited_mask(int tid, int parent_tid,
 }
 
 namespace {
+// 事务语义：逐 TID 写 mask，遇到首个非 ESRCH 错误就按逆序恢复本批次已经
+// 成功的 TID。restore_masks 保存策略介入前或应用最近声明的 mask；只有内核
+// 回读与目标完全一致时才计为 applied。该函数不决定 placement，只执行
+// selector 已确认的 delta。
 ApplyResult apply_delta(AffinityBackend &backend,
                         std::map<int, std::vector<int>> &restore_masks,
                         std::set<int> &acted_tids,
@@ -109,6 +113,8 @@ ApplyResult Actuator::apply(const PlacementDelta &placement,
 }
 
 RestoreResult Actuator::restore_all() {
+  // pause、故障和正常退出共用全量恢复路径。即使 TID 已退出也计 vanished，
+  // 不把 ESRCH 当作恢复失败；其他错误必须由 runtime 触发 hard failure。
   RestoreResult result;
   result.requested = acted_tids_.size();
   for (int tid : acted_tids_) {
@@ -124,6 +130,8 @@ RestoreResult Actuator::restore_all() {
 }
 
 RestoreResult Actuator::restore(const std::set<int> &tids) {
+  // domain release 只恢复确实由策略改过的 TID。未 acted 的继承线程无需系统
+  // 调用，其应用 mask 从未被 AffinityGraph 覆盖。
   RestoreResult result;
   for (int tid : tids) {
     if (!acted_tids_.contains(tid)) continue;

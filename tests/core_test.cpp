@@ -286,13 +286,46 @@ void test_numa_domain_family_selection_and_merge() {
               metric("brpc_light|worker").cross_seed &&
               metric("brpc_light|worker").anchor,
           "strong cross-family evidence seeds a non-cohesive worker family");
+  require(metric("brpc_light|worker").demand_eligible &&
+              metric("brpc_light|worker").internal_relation_eligible &&
+              !metric("brpc_light|worker").self_containment_eligible &&
+              !metric("brpc_light|worker").relative_internal_eligible &&
+              !metric("brpc_light|worker").cohesive_eligible,
+          "family diagnostics identify each failed cohesive gate");
   require(!metric("brpc_heavy|handler").cross_seed &&
               !metric("brpc_heavy|handler").anchor,
           "external-only handler cannot seed without internal evidence");
+  const auto pair = std::find_if(
+      proposal.family_pairs.begin(), proposal.family_pairs.end(),
+      [](const auto &value) {
+        return value.left == "Pipe_normal|pipe" &&
+               value.right == "brpc_light|worker";
+      });
+  require(pair != proposal.family_pairs.end() &&
+              pair->cross_relation == 8 && pair->denominator == 1.5 &&
+              pair->merge_ratio > 5.33 && pair->endpoints_eligible &&
+              pair->qualifies && pair->confirmation >= 3 && pair->confirmed,
+          "pair diagnostics expose aggregate ratio and confirmation");
+  require(proposal.input_family_count == 4 &&
+              proposal.input_cross_family_pair_count == 2 &&
+              proposal.selected_family_pair_count == 2 &&
+              std::abs(proposal.total_demand - 5.0) < 1e-12 &&
+              std::abs(proposal.total_relation - 47.5) < 1e-12,
+          "proposal diagnostics preserve selector input totals");
+  require(proposal.domains[0].previous_nodes.empty() &&
+              proposal.domains[0].target_nodes == std::vector<int>({2}) &&
+              proposal.domains[0].online_cpu_count == 4 &&
+              std::abs(proposal.domains[0].capacity_limit - 3.2) < 1e-12 &&
+              std::abs(proposal.domains[0].capacity_headroom - 0.6) < 1e-12 &&
+              proposal.domains[0].initial_migrations == 0 &&
+              proposal.domains[0].node_decision == "initial",
+          "node diagnostics expose capacity, migration, and decision reason");
   solver.commit(proposal, 70000000000ULL);
   auto stable = domain_windows(solver, h, threads, edges, 1);
   require(stable.ready && stable.actions.empty() &&
-              stable.released_tids.empty(),
+              stable.released_tids.empty() &&
+              stable.domains[0].previous_nodes == std::vector<int>({2}) &&
+              stable.domains[0].node_decision == "stable",
           "static domain produces no steady-state CPU or mask churn");
   solver.discard(stable);
 }

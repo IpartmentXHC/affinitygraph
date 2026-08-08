@@ -46,7 +46,8 @@ affinity-domain-replay --runtime-log runtime.jsonl \
 ```
 
 `affinitygraph.domain-replay-result.v1` reports per-window cohesive and
-cross-seeded anchors, domain families, thread count, demand, target nodes, and
-solve time, plus sequence solve-time P95. This tool is also read-only and links
-no runtime, BPF reader, collector, actuator, control socket, or affinity
+cross-seeded anchors, selected family-pair ratios and confirmations, domain
+families, thread count, demand, capacity headroom, node decision, target nodes,
+and solve time, plus sequence solve-time P95. This tool is also read-only and
+links no runtime, BPF reader, collector, actuator, control socket, or affinity
 backend.

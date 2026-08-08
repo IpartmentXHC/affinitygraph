@@ -29,12 +29,17 @@ struct ReplayFrame {
   std::map<int, std::vector<int>> allowed_masks;
 };
 
+// 该工具复用线上 NumaDomainSolver，但不链接 runtime、BPF reader 或 actuator。
+// 输入只取 runtime JSONL 中当时真实进入 plan 的 window，因而可以验证 selector
+// 的确定性和解释字段，同时保证 replay 不可能修改本机 affinity。
+
 struct FrameResult {
   std::string window_id;
   bool ready = false;
   bool valid = true;
   double solve_ms = 0;
   std::vector<FamilyMetric> families;
+  std::vector<FamilyPairMetric> family_pairs;
   std::vector<NumaDomain> domains;
 };
 
@@ -169,7 +174,8 @@ std::vector<FrameResult> replay(const HardwareGraph &hardware,
                           std::chrono::steady_clock::now() - started)
                           .count();
     results.push_back({frame.window_id, proposal.ready, proposal.valid, solve_ms,
-                       proposal.families, proposal.domains});
+                       proposal.families, proposal.family_pairs,
+                       proposal.domains});
     if (!proposal.valid ||
         (proposal.ready && (!proposal.actions.empty() ||
                             !proposal.released_tids.empty() ||
@@ -189,6 +195,7 @@ bool same_results(const std::vector<FrameResult> &left,
         left[index].ready != right[index].ready ||
         left[index].valid != right[index].valid ||
         left[index].families.size() != right[index].families.size() ||
+        left[index].family_pairs.size() != right[index].family_pairs.size() ||
         left[index].domains.size() != right[index].domains.size())
       return false;
     for (size_t family = 0; family < left[index].families.size(); ++family) {
@@ -198,6 +205,15 @@ bool same_results(const std::vector<FrameResult> &left,
           a.cohesive_anchor != b.cohesive_anchor || a.cross_seed != b.cross_seed ||
           a.confirmation != b.confirmation ||
           a.seed_confirmation != b.seed_confirmation)
+        return false;
+    }
+    for (size_t pair = 0; pair < left[index].family_pairs.size(); ++pair) {
+      const auto &a = left[index].family_pairs[pair];
+      const auto &b = right[index].family_pairs[pair];
+      if (a.left != b.left || a.right != b.right ||
+          a.cross_relation != b.cross_relation ||
+          a.merge_ratio != b.merge_ratio || a.qualifies != b.qualifies ||
+          a.confirmation != b.confirmation || a.confirmed != b.confirmed)
         return false;
     }
     for (size_t domain = 0; domain < left[index].domains.size(); ++domain) {
@@ -248,6 +264,22 @@ void write_result(const std::string &path, const std::vector<FrameResult> &frame
           << ",\"cross_seed\":" << (family.cross_seed ? "true" : "false")
           << '}';
     }
+    out << "], \"family_pairs\": [";
+    for (size_t pair = 0; pair < frame.family_pairs.size(); ++pair) {
+      const auto &value = frame.family_pairs[pair];
+      if (pair) out << ',';
+      out << "{\"left\":\"" << json_escape(value.left)
+          << "\",\"right\":\"" << json_escape(value.right)
+          << "\",\"cross_relation\":" << value.cross_relation
+          << ",\"denominator\":" << value.denominator
+          << ",\"merge_ratio\":" << value.merge_ratio
+          << ",\"endpoints_eligible\":"
+          << (value.endpoints_eligible ? "true" : "false")
+          << ",\"qualifies\":" << (value.qualifies ? "true" : "false")
+          << ",\"confirmation\":" << value.confirmation
+          << ",\"confirmed\":" << (value.confirmed ? "true" : "false")
+          << '}';
+    }
     out << "], \"domains\": [";
     for (size_t domain = 0; domain < frame.domains.size(); ++domain) {
       const auto &value = frame.domains[domain];
@@ -258,7 +290,12 @@ void write_result(const std::string &path, const std::vector<FrameResult> &frame
         out << '"' << json_escape(value.families[family]) << '"';
       }
       out << "],\"thread_count\":" << value.tids.size() << ",\"demand\":"
-          << value.demand << ",\"target_nodes\":[";
+          << value.demand << ",\"capacity_limit\":" << value.capacity_limit
+          << ",\"capacity_headroom\":" << value.capacity_headroom
+          << ",\"background_demand\":" << value.background_demand
+          << ",\"initial_migrations\":" << value.initial_migrations
+          << ",\"node_decision\":\"" << value.node_decision
+          << "\",\"target_nodes\":[";
       for (size_t node = 0; node < value.target_nodes.size(); ++node) {
         if (node) out << ',';
         out << value.target_nodes[node];

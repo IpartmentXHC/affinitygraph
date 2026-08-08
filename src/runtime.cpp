@@ -92,12 +92,44 @@ std::string family_metrics_json(const std::vector<FamilyMetric> &families) {
         << ",\"external_relation\":" << family.external_relation
         << ",\"self_containment\":" << family.self_containment
         << ",\"relative_internal\":" << family.relative_internal
+        << ",\"demand_eligible\":"
+        << (family.demand_eligible ? "true" : "false")
+        << ",\"internal_relation_eligible\":"
+        << (family.internal_relation_eligible ? "true" : "false")
+        << ",\"self_containment_eligible\":"
+        << (family.self_containment_eligible ? "true" : "false")
+        << ",\"relative_internal_eligible\":"
+        << (family.relative_internal_eligible ? "true" : "false")
+        << ",\"cohesive_eligible\":"
+        << (family.cohesive_eligible ? "true" : "false")
         << ",\"confirmation\":" << family.confirmation
         << ",\"seed_confirmation\":" << family.seed_confirmation
         << ",\"cohesive_anchor\":"
         << (family.cohesive_anchor ? "true" : "false")
         << ",\"cross_seed\":" << (family.cross_seed ? "true" : "false")
         << ",\"anchor\":" << (family.anchor ? "true" : "false") << '}';
+  }
+  out << ']';
+  return out.str();
+}
+
+std::string family_pairs_json(const std::vector<FamilyPairMetric> &pairs) {
+  std::ostringstream out;
+  out << '[';
+  for (size_t index = 0; index < pairs.size(); ++index) {
+    if (index) out << ',';
+    const auto &pair = pairs[index];
+    out << "{\"left\":\"" << json_escape(pair.left)
+        << "\",\"right\":\"" << json_escape(pair.right)
+        << "\",\"cross_relation\":" << pair.cross_relation
+        << ",\"denominator\":" << pair.denominator
+        << ",\"merge_ratio\":" << pair.merge_ratio
+        << ",\"endpoints_eligible\":"
+        << (pair.endpoints_eligible ? "true" : "false")
+        << ",\"qualifies\":" << (pair.qualifies ? "true" : "false")
+        << ",\"confirmation\":" << pair.confirmation
+        << ",\"confirmed\":" << (pair.confirmed ? "true" : "false")
+        << '}';
   }
   out << ']';
   return out.str();
@@ -115,9 +147,19 @@ std::string domains_json(const std::vector<NumaDomain> &domains) {
       out << '"' << json_escape(domain.families[family]) << '"';
     }
     out << "],\"thread_count\":" << domain.tids.size()
+        << ",\"previous_nodes\":" << cpu_array_json(domain.previous_nodes)
         << ",\"target_nodes\":" << cpu_array_json(domain.target_nodes)
         << ",\"target_mask\":\"" << format_cpu_list(domain.target_mask)
         << "\",\"demand\":" << domain.demand
+        << ",\"online_cpu_count\":" << domain.online_cpu_count
+        << ",\"capacity_limit\":" << domain.capacity_limit
+        << ",\"capacity_headroom\":" << domain.capacity_headroom
+        << ",\"relation_latency\":" << domain.relation_latency
+        << ",\"background_demand\":" << domain.background_demand
+        << ",\"initial_migrations\":" << domain.initial_migrations
+        << ",\"expand_confirmation\":" << domain.expand_confirmation
+        << ",\"shrink_confirmation\":" << domain.shrink_confirmation
+        << ",\"node_decision\":\"" << domain.node_decision << '"'
         << ",\"confirmation\":" << domain.confirmation
         << ",\"valid\":" << (domain.valid ? "true" : "false")
         << ",\"invalid_reason\":\"" << json_escape(domain.invalid_reason)
@@ -551,8 +593,9 @@ void Runtime::consume_pending_bpf() {
   }
   std::unordered_set<uint64_t> retained_pairs;
   if (config_.solver == "numa-domain-v1") {
-    // NUMA placement aggregates complete relation evidence by family before
-    // applying its family-level heavy-hitter bound.
+    // NUMA-domain 策略必须把所有 TID pair 送到 GraphWindow。这里若按 TID
+    // 提前截断，512 个 worker 分散产生的弱边会在 family 聚合前丢失，最终
+    // X_gh 会系统性偏小。family-level top-K 只在 domain_solver.cpp 中执行。
     retained_pairs.reserve(pair_weights.size());
     for (const auto &[pair, _] : pair_weights) retained_pairs.insert(pair);
   } else {
@@ -830,13 +873,9 @@ void Runtime::solve_numa_domains(
     const std::string &window_id, const std::vector<ThreadDemand> &demands,
     const std::vector<RelationEdge> &edges,
     const std::map<int, std::vector<int>> &allowed_masks, uint64_t now) {
-  if (!bpf_reader_ || !bpf_health_.valid || !bpf_window_ready_ ||
-      bpf_window_loss_ratio_ >= 0.01) {
-    selector_ready_ = false;
-    log("solve_window_end", "\"window_id\":\"" + window_id +
-        "\",\"complete\":true,\"outcome\":\"waiting_required_bpf\"");
-    return;
-  }
+  // NUMA selector 的 options 必须和 selector_input 日志使用同一份配置值。
+  // 即使 BPF gate 未通过也先记录输入，这样第一条失败窗口就能直接看出
+  // solver 收到了什么，以及究竟是哪一个采集健康条件阻止了求解。
   NumaDomainOptions options;
   options.family_minimum_demand = config_.family_minimum_demand;
   options.family_minimum_internal_relation =
@@ -864,6 +903,83 @@ void Runtime::solve_numa_domains(
       static_cast<uint64_t>(config_.domain_minimum_dwell_seconds) *
       1000000000ULL;
 
+  std::set<std::string> input_families;
+  std::set<int> input_nodes;
+  size_t empty_allowed_masks = 0;
+  size_t online_cpus = 0;
+  double total_demand = 0;
+  double total_relation = 0;
+  for (const auto &demand : demands) {
+    input_families.insert(demand.group);
+    total_demand += demand.demand;
+  }
+  for (const auto &edge : edges) total_relation += edge.score;
+  for (const auto &[_, mask] : allowed_masks)
+    if (mask.empty()) ++empty_allowed_masks;
+  for (const auto &cpu : hardware_.cpus)
+    if (cpu.online) {
+      ++online_cpus;
+      input_nodes.insert(cpu.node);
+    }
+  const bool bpf_gate_passed =
+      bpf_reader_ && bpf_health_.valid && bpf_window_ready_ &&
+      bpf_window_loss_ratio_ < 0.01;
+  log("selector_input", "\"window_id\":\"" + window_id +
+      "\",\"strategy_id\":\"numa-domain-v1\"" +
+      ",\"threads\":" + std::to_string(demands.size()) +
+      ",\"families\":" + std::to_string(input_families.size()) +
+      ",\"relation_edges\":" + std::to_string(edges.size()) +
+      ",\"total_demand\":" + std::to_string(total_demand) +
+      ",\"total_relation\":" + std::to_string(total_relation) +
+      ",\"allowed_masks\":" + std::to_string(allowed_masks.size()) +
+      ",\"empty_allowed_masks\":" + std::to_string(empty_allowed_masks) +
+      ",\"online_cpus\":" + std::to_string(online_cpus) +
+      ",\"online_nodes\":" + std::to_string(input_nodes.size()) +
+      ",\"current_managed_threads\":" +
+          std::to_string(domain_solver_.placement().size()) +
+      ",\"bpf_reader\":" + (bpf_reader_ ? "true" : "false") +
+      ",\"bpf_health_valid\":" +
+          (bpf_health_.valid ? "true" : "false") +
+      ",\"bpf_window_ready\":" +
+          (bpf_window_ready_ ? "true" : "false") +
+      ",\"bpf_window_loss_ratio\":" +
+          std::to_string(bpf_window_loss_ratio_) +
+      ",\"bpf_gate_passed\":" + (bpf_gate_passed ? "true" : "false") +
+      ",\"thresholds\":{\"family_minimum_demand\":" +
+          std::to_string(options.family_minimum_demand) +
+      ",\"family_minimum_internal_relation\":" +
+          std::to_string(options.family_minimum_internal_relation) +
+      ",\"family_minimum_self_containment\":" +
+          std::to_string(options.family_minimum_self_containment) +
+      ",\"family_minimum_relative_internal\":" +
+          std::to_string(options.family_minimum_relative_internal) +
+      ",\"domain_merge_ratio\":" +
+          std::to_string(options.domain_merge_ratio) +
+      ",\"family_edges_per_family\":" +
+          std::to_string(options.family_edges_per_family) +
+      ",\"family_stability_confirmations\":" +
+          std::to_string(options.family_stability_confirmations) +
+      ",\"domain_stability_confirmations\":" +
+          std::to_string(options.domain_stability_confirmations) +
+      ",\"plan_confirmations\":" +
+          std::to_string(options.plan_confirmations) +
+      ",\"maximum_threads_per_domain\":" +
+          std::to_string(options.maximum_threads_per_domain) +
+      ",\"capacity_ratio\":" + std::to_string(options.capacity_ratio) +
+      ",\"expand_ratio\":" + std::to_string(options.expand_ratio) +
+      ",\"shrink_ratio\":" + std::to_string(options.shrink_ratio) + "}");
+  if (!bpf_gate_passed) {
+    selector_ready_ = false;
+    log("selector_output", "\"window_id\":\"" + window_id +
+        "\",\"strategy_id\":\"numa-domain-v1\"" +
+        ",\"evaluated\":false,\"ready\":false,\"valid\":false" +
+        ",\"outcome\":\"waiting_required_bpf\"" +
+        ",\"domains\":0,\"controlled_threads\":0,\"actions\":0");
+    log("solve_window_end", "\"window_id\":\"" + window_id +
+        "\",\"complete\":true,\"outcome\":\"waiting_required_bpf\"");
+    return;
+  }
+
   auto started = std::chrono::steady_clock::now();
   auto proposal = domain_solver_.propose(hardware_, demands, edges,
                                          allowed_masks, options, now);
@@ -873,6 +989,62 @@ void Runtime::solve_numa_domains(
   size_t forced_migrations = std::count_if(
       proposal.actions.begin(), proposal.actions.end(),
       [](const auto &action) { return action.forced_migration; });
+  const size_t cohesive_eligible = std::count_if(
+      proposal.families.begin(), proposal.families.end(),
+      [](const auto &family) { return family.cohesive_eligible; });
+  const size_t cohesive_anchors = std::count_if(
+      proposal.families.begin(), proposal.families.end(),
+      [](const auto &family) { return family.cohesive_anchor; });
+  const size_t cross_seed_families = std::count_if(
+      proposal.families.begin(), proposal.families.end(),
+      [](const auto &family) { return family.cross_seed; });
+  const size_t qualified_pairs = std::count_if(
+      proposal.family_pairs.begin(), proposal.family_pairs.end(),
+      [](const auto &pair) { return pair.qualifies; });
+  const size_t confirmed_pairs = std::count_if(
+      proposal.family_pairs.begin(), proposal.family_pairs.end(),
+      [](const auto &pair) { return pair.confirmed; });
+  size_t controlled_threads = 0;
+  std::set<std::string> controlled_families;
+  for (const auto &domain : proposal.domains) {
+    controlled_threads += domain.tids.size();
+    controlled_families.insert(domain.families.begin(), domain.families.end());
+  }
+  log("selector_output", "\"window_id\":\"" + window_id +
+      "\",\"strategy_id\":\"numa-domain-v1\"" +
+      ",\"evaluated\":true,\"valid\":" +
+          (proposal.valid ? "true" : "false") +
+      ",\"ready\":" + (proposal.ready ? "true" : "false") +
+      ",\"invalid_reason\":\"" + json_escape(proposal.invalid_reason) +
+      "\",\"solve_duration_ns\":" + std::to_string(duration_ns) +
+      ",\"input_families\":" +
+          std::to_string(proposal.input_family_count) +
+      ",\"input_cross_family_pairs\":" +
+          std::to_string(proposal.input_cross_family_pair_count) +
+      ",\"selected_family_pairs\":" +
+          std::to_string(proposal.selected_family_pair_count) +
+      ",\"cohesive_eligible_families\":" +
+          std::to_string(cohesive_eligible) +
+      ",\"cohesive_anchors\":" + std::to_string(cohesive_anchors) +
+      ",\"cross_seed_families\":" +
+          std::to_string(cross_seed_families) +
+      ",\"qualified_pairs\":" + std::to_string(qualified_pairs) +
+      ",\"confirmed_pairs\":" + std::to_string(confirmed_pairs) +
+      ",\"domains\":" + std::to_string(proposal.domains.size()) +
+      ",\"controlled_families\":" +
+          std::to_string(controlled_families.size()) +
+      ",\"controlled_threads\":" + std::to_string(controlled_threads) +
+      ",\"planned_masks\":" +
+          std::to_string(proposal.planned_masks.size()) +
+      ",\"mask_updates\":" + std::to_string(proposal.actions.size()) +
+      ",\"inherited_threads\":" +
+          std::to_string(proposal.inherited_tids.size()) +
+      ",\"released_threads\":" +
+          std::to_string(proposal.released_tids.size()) +
+      ",\"forced_migrations\":" + std::to_string(forced_migrations) +
+      ",\"family_metrics\":" + family_metrics_json(proposal.families) +
+      ",\"family_pairs\":" + family_pairs_json(proposal.family_pairs) +
+      ",\"domain_details\":" + domains_json(proposal.domains));
   log("plan", "\"window_id\":\"" + window_id +
       "\",\"strategy_id\":\"numa-domain-v1\"" +
       ",\"affinity_granularity\":\"numa_node_mask\"" +
@@ -884,6 +1056,7 @@ void Runtime::solve_numa_domains(
           std::to_string(proposal.inherited_tids.size()) +
       ",\"forced_migrations\":" + std::to_string(forced_migrations) +
       ",\"family_metrics\":" + family_metrics_json(proposal.families) +
+      ",\"family_pairs\":" + family_pairs_json(proposal.family_pairs) +
       ",\"domains\":" + domains_json(proposal.domains) +
       ",\"planned_masks\":" + masks_json(proposal.planned_masks) +
       ",\"actions\":" + domain_actions_json(proposal.actions));
@@ -931,6 +1104,18 @@ void Runtime::solve_numa_domains(
     return;
   }
 
+  // active actuator 输入与 selector 输出分开记录：selector_output 描述“想做
+  // 什么”，actuator_input/output 描述“内核实际接受了什么”。排障时先按
+  // window_id 关联三条事件，不需要展开每个 thread_window。
+  log("actuator_input", "\"window_id\":\"" + window_id +
+      "\",\"strategy_id\":\"numa-domain-v1\"" +
+      ",\"live_threads\":" + std::to_string(demands.size()) +
+      ",\"release_threads\":" +
+          std::to_string(proposal.released_tids.size()) +
+      ",\"mask_updates\":" + std::to_string(proposal.actions.size()) +
+      ",\"forced_migrations\":" + std::to_string(forced_migrations) +
+      ",\"target_masks\":" + masks_json(proposal.delta.tid_to_mask) +
+      ",\"actions\":" + domain_actions_json(proposal.actions));
   if (!proposal.released_tids.empty()) {
     auto restored = actuator_.restore(proposal.released_tids);
     last_restore_ = restored;
@@ -940,6 +1125,12 @@ void Runtime::solve_numa_domains(
         ",\"vanished\":" + std::to_string(restored.vanished) +
         ",\"failed\":" + std::to_string(restored.failed));
     if (!restored.success()) {
+      log("actuator_output", "\"window_id\":\"" + window_id +
+          "\",\"stage\":\"restore\",\"success\":false" +
+          ",\"requested\":" + std::to_string(restored.requested) +
+          ",\"restored\":" + std::to_string(restored.restored) +
+          ",\"vanished\":" + std::to_string(restored.vanished) +
+          ",\"failed\":" + std::to_string(restored.failed));
       domain_solver_.discard(proposal);
       trigger_fatal("NUMA domain affinity restore failed");
       return;
@@ -962,6 +1153,17 @@ void Runtime::solve_numa_domains(
       ",\"mask_updates\":" + std::to_string(proposal.actions.size()) +
       ",\"forced_migrations\":" + std::to_string(forced_migrations) +
       ",\"actions\":" + domain_actions_json(proposal.actions));
+  log("actuator_output", "\"window_id\":\"" + window_id +
+      "\",\"stage\":\"apply\",\"success\":" +
+          (result.success ? "true" : "false") +
+      ",\"requested\":" + std::to_string(result.requested) +
+      ",\"applied\":" + std::to_string(result.applied) +
+      ",\"committed\":" + std::to_string(result.committed) +
+      ",\"vanished\":" + std::to_string(result.vanished) +
+      ",\"rolled_back\":" + std::to_string(result.rolled_back) +
+      ",\"rollback_success\":" +
+          (result.rollback_success ? "true" : "false") +
+      ",\"error\":" + std::to_string(result.error));
   if (!result.success) {
     domain_solver_.discard(proposal);
     log("solve_window_end", "\"window_id\":\"" + window_id +
@@ -999,6 +1201,8 @@ void Runtime::maybe_solve(uint64_t now) {
       ",\"mode\":\"" +
       std::string(config_.mode == Mode::Active ? "active" :
                   config_.mode == Mode::Plan ? "plan" : "observe") + "\"");
+  // 一次 solve window 的原始可回放输入由 thread_window + relation_edge 构成。
+  // selector_input 是面向值班人员的紧凑摘要，原始事件则保留逐 TID 证据。
   auto demands = graph_.demands();
   std::map<int, std::vector<int>> allowed_masks;
   auto thread_records = graph_.thread_records();

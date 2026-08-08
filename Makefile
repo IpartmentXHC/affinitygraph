@@ -59,6 +59,8 @@ test: all
 	grep -q '"deterministic": true' $(BUILD)/domain-replay-result.json
 	grep -q '"ready": true' $(BUILD)/domain-replay-result.json
 	grep -q '"families":\["family-a","family-b"\]' $(BUILD)/domain-replay-result.json
+	grep -q '"family_pairs": \[' $(BUILD)/domain-replay-result.json
+	grep -q '"node_decision":"initial"' $(BUILD)/domain-replay-result.json
 	$(BUILD)/affinity-run run --config tests/runtime.toml -- $(BUILD)/supervisor-test
 	sh tests/supervisor_test.sh
 

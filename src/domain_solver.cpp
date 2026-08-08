@@ -82,75 +82,99 @@ bool cpu_in_nodes(const HardwareGraph &hardware, int cpu,
          std::find(nodes.begin(), nodes.end(), found->node) != nodes.end();
 }
 
-std::vector<int> choose_nodes(const HardwareGraph &hardware, double demand,
-                              double capacity_ratio,
-                              const std::vector<ThreadDemand> &members,
-                              const std::vector<ThreadDemand> &all_threads,
-                              const std::vector<std::pair<
-                                  std::vector<std::string>, std::vector<int>>>
-                                  &placed_domains,
-                              const std::vector<std::string> &families,
-                              const std::map<std::pair<std::string, std::string>,
-                                             double> &cross) {
-  auto nodes = hardware.nodes();
-  if (nodes.empty()) return {};
-  std::vector<int> best;
-  double best_relation_latency = 0;
-  double best_background_demand = 0;
-  int best_migrations = 0;
+struct NodeChoice {
+  std::vector<int> nodes;
+  size_t online_cpu_count = 0;
+  double capacity_limit = 0;
+  double capacity_headroom = 0;
+  double relation_latency = 0;
+  double background_demand = 0;
+  int initial_migrations = 0;
+};
+
+// 计算一个 node 集的完整诊断值。该函数同时服务候选排序和最终日志，确保
+// 日志里的 background demand、首次迁移数与 solver 真正比较的数值一致。
+NodeChoice evaluate_nodes(
+    const HardwareGraph &hardware, const std::vector<int> &nodes,
+    double demand, double capacity_ratio,
+    const std::vector<ThreadDemand> &members,
+    const std::vector<ThreadDemand> &all_threads,
+    const std::vector<std::pair<std::vector<std::string>, std::vector<int>>>
+        &placed_domains,
+    const std::vector<std::string> &families,
+    const std::map<std::pair<std::string, std::string>, double> &cross) {
+  NodeChoice choice;
+  choice.nodes = nodes;
+  choice.online_cpu_count = mask_for_nodes(hardware, nodes).size();
+  choice.capacity_limit = choice.online_cpu_count * capacity_ratio;
+  choice.capacity_headroom = choice.capacity_limit - demand;
   std::set<int> member_tids;
   for (const auto &member : members) member_tids.insert(member.identity.tid);
+  for (const auto &thread : members)
+    if (!cpu_in_nodes(hardware, thread.current_cpu, nodes))
+      ++choice.initial_migrations;
+  for (const auto &thread : all_threads)
+    if (!member_tids.contains(thread.identity.tid) &&
+        cpu_in_nodes(hardware, thread.current_cpu, nodes))
+      choice.background_demand += thread.demand;
+  for (const auto &[other_families, other_nodes] : placed_domains) {
+    double weight = 0;
+    for (const auto &family : families)
+      for (const auto &other : other_families) {
+        auto found = cross.find(std::minmax(family, other));
+        if (found != cross.end()) weight += found->second;
+      }
+    double distance = 1e30;
+    for (int node : nodes)
+      for (int other : other_nodes) {
+        auto found = hardware.node_distance.find({node, other});
+        distance = std::min(distance, found == hardware.node_distance.end()
+                                          ? 1e6
+                                          : found->second);
+      }
+    choice.relation_latency += weight * (distance == 1e30 ? 0 : distance);
+  }
+  return choice;
+}
+
+// 枚举 NUMA node 子集并按设计中的字典序选最优解：最少 node、跨 domain
+// 关系延迟、非受管 demand、首次迁移数、node ID。这里不做 CPU singleton
+// 分配；输出始终是完整 node mask。
+NodeChoice choose_nodes(
+    const HardwareGraph &hardware, double demand, double capacity_ratio,
+    const std::vector<ThreadDemand> &members,
+    const std::vector<ThreadDemand> &all_threads,
+    const std::vector<std::pair<std::vector<std::string>, std::vector<int>>>
+        &placed_domains,
+    const std::vector<std::string> &families,
+    const std::map<std::pair<std::string, std::string>, double> &cross) {
+  auto nodes = hardware.nodes();
+  if (nodes.empty()) return {};
+  NodeChoice best;
   std::vector<int> candidate;
   std::function<void(size_t)> visit = [&](size_t index) {
     if (index == nodes.size()) {
       if (candidate.empty()) return;
-      size_t cpu_count = mask_for_nodes(hardware, candidate).size();
-      if (static_cast<double>(cpu_count) * capacity_ratio + 1e-12 < demand)
-        return;
-      int migrations = 0;
-      for (const auto &thread : members)
-        if (!cpu_in_nodes(hardware, thread.current_cpu, candidate)) ++migrations;
-      double background_demand = 0;
-      for (const auto &thread : all_threads)
-        if (!member_tids.contains(thread.identity.tid) &&
-            cpu_in_nodes(hardware, thread.current_cpu, candidate))
-          background_demand += thread.demand;
-      double relation_latency = 0;
-      for (const auto &[other_families, other_nodes] : placed_domains) {
-        double weight = 0;
-        for (const auto &family : families)
-          for (const auto &other : other_families) {
-            auto found = cross.find(std::minmax(family, other));
-            if (found != cross.end()) weight += found->second;
-          }
-        double distance = 1e30;
-        for (int node : candidate)
-          for (int other : other_nodes) {
-            auto found = hardware.node_distance.find({node, other});
-            distance = std::min(distance, found == hardware.node_distance.end()
-                                              ? 1e6
-                                              : found->second);
-          }
-        relation_latency += weight * (distance == 1e30 ? 0 : distance);
-      }
-      if (best.empty() || candidate.size() < best.size() ||
-          (candidate.size() == best.size() &&
-           relation_latency < best_relation_latency) ||
-          (candidate.size() == best.size() &&
-           relation_latency == best_relation_latency &&
-           background_demand < best_background_demand) ||
-          (candidate.size() == best.size() &&
-           relation_latency == best_relation_latency &&
-           background_demand == best_background_demand &&
-           migrations < best_migrations) ||
-          (candidate.size() == best.size() &&
-           relation_latency == best_relation_latency &&
-           background_demand == best_background_demand &&
-           migrations == best_migrations && candidate < best)) {
-        best = candidate;
-        best_relation_latency = relation_latency;
-        best_background_demand = background_demand;
-        best_migrations = migrations;
+      auto current = evaluate_nodes(hardware, candidate, demand, capacity_ratio,
+                                    members, all_threads, placed_domains,
+                                    families, cross);
+      if (current.capacity_headroom + 1e-12 < 0) return;
+      if (best.nodes.empty() || current.nodes.size() < best.nodes.size() ||
+          (current.nodes.size() == best.nodes.size() &&
+           current.relation_latency < best.relation_latency) ||
+          (current.nodes.size() == best.nodes.size() &&
+           current.relation_latency == best.relation_latency &&
+           current.background_demand < best.background_demand) ||
+          (current.nodes.size() == best.nodes.size() &&
+           current.relation_latency == best.relation_latency &&
+           current.background_demand == best.background_demand &&
+           current.initial_migrations < best.initial_migrations) ||
+          (current.nodes.size() == best.nodes.size() &&
+           current.relation_latency == best.relation_latency &&
+           current.background_demand == best.background_demand &&
+           current.initial_migrations == best.initial_migrations &&
+           current.nodes < best.nodes)) {
+        best = std::move(current);
       }
       return;
     }
@@ -174,15 +198,21 @@ NumaDomainProposal NumaDomainSolver::propose(
   NumaDomainProposal proposal;
   proposal.id = next_proposal_id_++;
 
+  // 输入阶段：ThreadDemand 已携带 placement family。这里先完成全量 family
+  // 聚合，任何 top-K 都发生在聚合之后。total_* 和 pair 数量会原样进入
+  // selector_output，便于确认一次 solve 实际看到了多少证据。
   std::map<int, ThreadDemand> by_tid;
   std::map<std::string, std::vector<ThreadDemand>> by_family;
   for (const auto &thread : threads) {
     by_tid[thread.identity.tid] = thread;
     by_family[thread.group].push_back(thread);
+    proposal.total_demand += thread.demand;
   }
+  proposal.input_family_count = by_family.size();
   std::map<std::string, double> internal, external;
   std::map<std::pair<std::string, std::string>, double> cross;
   for (const auto &edge : edges) {
+    proposal.total_relation += edge.score;
     auto from = by_tid.find(edge.from_tid), to = by_tid.find(edge.to_tid);
     if (from == by_tid.end() || to == by_tid.end()) continue;
     const auto &a = from->second.group;
@@ -195,6 +225,7 @@ NumaDomainProposal NumaDomainSolver::propose(
       cross[std::minmax(a, b)] += edge.score;
     }
   }
+  proposal.input_cross_family_pair_count = cross.size();
   double maximum_internal = 0;
   for (const auto &[_, value] : internal)
     maximum_internal = std::max(maximum_internal, value);
@@ -214,11 +245,19 @@ NumaDomainProposal NumaDomainSolver::propose(
     metric.relative_internal = maximum_internal > 0
                                    ? metric.internal_relation / maximum_internal
                                    : 0;
-    bool cohesive =
-        metric.demand >= options.family_minimum_demand &&
-        metric.internal_relation >= options.family_minimum_internal_relation &&
-        metric.self_containment >= options.family_minimum_self_containment &&
+    metric.demand_eligible =
+        metric.demand >= options.family_minimum_demand;
+    metric.internal_relation_eligible =
+        metric.internal_relation >= options.family_minimum_internal_relation;
+    metric.self_containment_eligible =
+        metric.self_containment >= options.family_minimum_self_containment;
+    metric.relative_internal_eligible =
         metric.relative_internal >= options.family_minimum_relative_internal;
+    metric.cohesive_eligible =
+        metric.demand_eligible && metric.internal_relation_eligible &&
+        metric.self_containment_eligible &&
+        metric.relative_internal_eligible;
+    bool cohesive = metric.cohesive_eligible;
     metric.confirmation = cohesive ? ++family_confirmations_[name] : 0;
     if (!cohesive) family_confirmations_[name] = 0;
     metric.cohesive_anchor =
@@ -234,6 +273,7 @@ NumaDomainProposal NumaDomainSolver::propose(
   // stable cross-family seed.
   const auto selected_cross =
       select_family_edges(cross, options.family_edges_per_family);
+  proposal.selected_family_pair_count = selected_cross.size();
   std::set<std::pair<std::string, std::string>> evaluated_merges;
   std::vector<std::pair<std::string, std::string>> confirmed_seeds;
   for (const auto &pair : selected_cross) {
@@ -251,6 +291,18 @@ NumaDomainProposal NumaDomainSolver::propose(
                      weight / denominator >= options.domain_merge_ratio;
     int confirmation = qualifies ? ++merge_confirmations_[pair] : 0;
     if (!qualifies) merge_confirmations_[pair] = 0;
+    FamilyPairMetric pair_metric;
+    pair_metric.left = pair.first;
+    pair_metric.right = pair.second;
+    pair_metric.cross_relation = weight;
+    pair_metric.denominator = denominator;
+    pair_metric.merge_ratio = denominator > 0 ? weight / denominator : 0;
+    pair_metric.endpoints_eligible = endpoints_eligible;
+    pair_metric.qualifies = qualifies;
+    pair_metric.confirmation = confirmation;
+    pair_metric.confirmed =
+        confirmation >= options.domain_stability_confirmations;
+    proposal.family_pairs.push_back(std::move(pair_metric));
     metrics[pair.first].seed_confirmation =
         std::max(metrics[pair.first].seed_confirmation, confirmation);
     metrics[pair.second].seed_confirmation =
@@ -265,6 +317,9 @@ NumaDomainProposal NumaDomainSolver::propose(
     if (!evaluated_merges.contains(pair)) confirmation = 0;
 
   std::set<std::string> anchors;
+  // 输出 family 集合是两条证据路径的并集。cohesive_anchor 需要 S_g/P_g，
+  // cross_seed 则只依赖双方绝对证据和稳定 X_gh；因此 self-containment 不是
+  // 全局硬门槛，外部-only family 又不会被误纳入。
   for (auto &[name, metric] : metrics) {
     metric.anchor = metric.cohesive_anchor || metric.cross_seed;
     if (metric.anchor) anchors.insert(name);
@@ -303,9 +358,13 @@ NumaDomainProposal NumaDomainSolver::propose(
       domain.invalid_reason = "maximum_threads_per_domain_exceeded";
     }
 
-    auto required_nodes = choose_nodes(
+    // Capacity planner 先给出当前窗口的无状态最优解，再由 lifecycle 的
+    // expand/shrink confirmation 与 dwell 决定是否采用。domain.node_decision
+    // 明确记录最终是 initial/stable/held/expanded/shrunk。
+    auto node_choice = choose_nodes(
         hardware, domain.demand, options.capacity_ratio, members, threads,
         placed_domains, family_names, cross);
+    auto required_nodes = node_choice.nodes;
     if (required_nodes.empty()) {
       domain.valid = false;
       domain.invalid_reason = "insufficient_node_capacity";
@@ -313,6 +372,7 @@ NumaDomainProposal NumaDomainSolver::propose(
     auto previous = domain_nodes_.find(domain.id);
     if (previous != domain_nodes_.end() && !previous->second.empty() &&
         domain.valid) {
+      domain.previous_nodes = previous->second;
       auto previous_mask = mask_for_nodes(hardware, previous->second);
       double utilization = previous_mask.empty()
                                ? 1.0
@@ -327,13 +387,42 @@ NumaDomainProposal NumaDomainSolver::propose(
           expand ? expand_confirmations_[domain.id] + 1 : 0;
       shrink_confirmations_[domain.id] =
           shrink ? shrink_confirmations_[domain.id] + 1 : 0;
-      if (!(expand && expand_confirmations_[domain.id] >=
-                         options.expand_confirmations) &&
-          !(shrink && shrink_confirmations_[domain.id] >=
-                         options.shrink_confirmations))
+      const bool expand_confirmed =
+          expand && expand_confirmations_[domain.id] >=
+                        options.expand_confirmations;
+      const bool shrink_confirmed =
+          shrink && shrink_confirmations_[domain.id] >=
+                        options.shrink_confirmations;
+      if (expand_confirmed) {
+        domain.node_decision = "expanded";
+      } else if (shrink_confirmed) {
+        domain.node_decision = "shrunk";
+      } else {
+        if (required_nodes == previous->second)
+          domain.node_decision = "stable";
+        else if (expand)
+          domain.node_decision = "held_expand_pending";
+        else if (shrink)
+          domain.node_decision = "held_shrink_pending";
+        else
+          domain.node_decision = "held_existing";
         required_nodes = previous->second;
+      }
+    } else if (domain.valid) {
+      domain.node_decision = "initial";
     }
+    domain.expand_confirmation = expand_confirmations_[domain.id];
+    domain.shrink_confirmation = shrink_confirmations_[domain.id];
+    node_choice = evaluate_nodes(hardware, required_nodes, domain.demand,
+                                 options.capacity_ratio, members, threads,
+                                 placed_domains, family_names, cross);
     domain.target_nodes = required_nodes;
+    domain.online_cpu_count = node_choice.online_cpu_count;
+    domain.capacity_limit = node_choice.capacity_limit;
+    domain.capacity_headroom = node_choice.capacity_headroom;
+    domain.relation_latency = node_choice.relation_latency;
+    domain.background_demand = node_choice.background_demand;
+    domain.initial_migrations = node_choice.initial_migrations;
     placed_domains.push_back({family_names, required_nodes});
     domain.target_mask = mask_for_nodes(hardware, required_nodes);
     for (const auto &member : members) {
@@ -366,6 +455,8 @@ NumaDomainProposal NumaDomainSolver::propose(
     if (!next_tids.contains(tid)) proposal.released_tids.insert(tid);
 
   const std::string signature = plan_signature(proposal.domains);
+  // plan confirmation 针对完整 domain+node signature，而不是单个 family。
+  // 只有整个输出连续稳定，active 才会看到 ready=true。
   if (signature == pending_signature_)
     ++global_plan_confirmation_;
   else {
@@ -382,6 +473,8 @@ NumaDomainProposal NumaDomainSolver::propose(
                     (proposal.domains.empty() && !proposal.released_tids.empty()));
 
   if (proposal.ready) {
+    // 只生成真正发生 mask 变化的 action。新线程若已经继承正确 mask，只记入
+    // inherited_tids，避免重复 sched_setaffinity 和无意义迁移。
     for (const auto &[tid, target] : proposal.delta.tid_to_mask) {
       auto current = placement_.find(tid);
       if (current != placement_.end() && current->second == target) continue;
@@ -421,6 +514,8 @@ void NumaDomainSolver::commit(const NumaDomainProposal &proposal,
                               const std::set<int> &committed_tids) {
   if (!outstanding_ || outstanding_->id != proposal.id)
     throw std::logic_error("NUMA domain proposal is not outstanding");
+  // commit 只接收 actuator 已确认成功的 TID。未提交的 action 不得进入内部
+  // placement 状态，否则 status 会声称一个实际上不存在的 affinity mask。
   for (int tid : proposal.released_tids) placement_.erase(tid);
   std::set<int> action_tids;
   for (const auto &action : proposal.actions)

@@ -110,9 +110,11 @@ void GraphWindow::retain_relations(
 std::string GraphWindow::normalize_group(const std::string &comm, uintptr_t start_routine,
                                          int parent_tid, const std::string &start_symbol) {
   (void)parent_tid;
+  // placement family 只由稳定名称和创建入口组成。末尾序号会随线程重建变化，
+  // parent lineage 适合做身份追踪但不应拆分同一 worker pool，因此都不进入
+  // family key。解析到符号时优先使用符号，避免 ASLR 地址跨进程变化。
   std::string normalized = std::regex_replace(comm, std::regex("([_-]?[0-9]+)+$"), "");
   if (normalized.empty()) normalized = "unnamed";
-  // Creation lineage remains identity metadata; it must not split a worker family.
   std::string routine = start_symbol.empty() ? std::to_string(start_routine) : start_symbol;
   return normalized + "@" + routine;
 }
@@ -122,6 +124,8 @@ std::vector<ThreadDemand> GraphWindow::demands() const {
   std::vector<ThreadDemand> result;
   for (const auto &[tid, history] : threads_) {
     if (history.empty()) continue;
+    // demand 是窗口内 (runtime + runqueue) / wall-time 的 EWMA，范围 [0,1]。
+    // coverage 只表示样本覆盖，不参与 NUMA-domain 的名称或关系判断。
     std::vector<double> pressure;
     for (size_t i = 1; i < history.size(); ++i) {
       const auto &a = history[i - 1], &b = history[i];
@@ -195,6 +199,8 @@ std::vector<RelationEdge> GraphWindow::edges() const {
     if (!aggregate.count || !demand.contains(pair.first) ||
         !demand.contains(pair.second)) continue;
     double count = static_cast<double>(aggregate.count);
+    // score 保留三类互补信号：双方活跃度、futex handoff、共享 VFS 活跃时间。
+    // stability 同时惩罚覆盖不足和高变异，避免一次突发事件变成强关系边。
     double sync = std::max(aggregate.forward_sync, aggregate.reverse_sync) / count;
     double share = aggregate.share / count;
     double overlap = aggregate.overlap / count;
