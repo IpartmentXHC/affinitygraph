@@ -30,24 +30,38 @@ The runtime has four paths:
    Process `numa_maps` remains process-scoped and is never presented as
    per-thread locality.
 4. A 60-second graph computes
-   `d_i = clamp(EWMA_30s((run+rq)/dt),0,1)`, then performs deterministic
-   capacity-first NUMA partitioning and LPT singleton placement. Confidence,
-   confirmation, dwell, and migration limits guard action. Confirmation means
-   that the materially active `(tgid, tid, generation)` cohort remains eligible
-   for three solve windows; a cohort of at least 20 threads may grow by at most
-   five percent while all existing identities remain present. Removal, identity
-   replacement, or larger growth resets confirmation. The latest dynamic
-   placement is then applied. CPU assignments are intentionally excluded because an unpinned
-   thread's sampled current CPU changes under the default scheduler. A
-   non-ESRCH batch failure rolls back earlier calls.
+   `d_i = clamp(EWMA_30s((run+rq)/dt),0,1)`. After confidence and BPF-health
+   gates pass, `numa-domain-v1` aggregates placement families by normalized
+   name and resolved start symbol. Demand, internal relationship weight,
+   self-containment, and relative internal strength must remain above their
+   thresholds for three solve windows before a family becomes a cohesive
+   singleton anchor. A second path permits two families with sufficient demand
+   and absolute internal evidence to seed a domain when their aggregated
+   cross-family ratio is stable for three windows. This path does not lower the
+   self-containment or relative-internal thresholds, and external-only handlers
+   cannot seed a domain.
+5. TID edges are aggregated by family before deterministic per-family
+   heavy-hitter pruning. Stable cross-family seeds merge controlled families
+   into domains. Each complete
+   domain, up to 1024 threads, receives the smallest deterministic NUMA-node
+   mask whose online CPUs provide 80% demand headroom. The mask is intersected
+   with the resource and application envelope. Linux schedules within the
+   mask; there are no steady-state CPU moves or swaps. Expansion and shrink use
+   asymmetric utilization confirmation and a 300-second domain dwell.
+6. Plan mode advances isolated shadow state. Active changes a complete mask
+   batch only after whole-plan confirmation and actuator verification. A
+   non-ESRCH failure restores every completed TID to its pre-batch mask. A new
+   member already carrying its domain mask is recorded as inherited without a
+   redundant syscall. The legacy singleton solver remains replayable.
 
 The supervisor's own affinity syscalls originate outside tracked TGIDs, so the
 BPF filter naturally distinguishes them from application declarations. A new
 thread restores to its parent's saved application mask when its observed mask
 was inherited from an AffinityGraph pin.
 
-The solver objective remains lexicographic: CPU/node overload,
-relationship-weighted hardware latency, then active migration cost. PMU,
+Domain node selection is lexicographic: sufficient capacity with the fewest
+nodes, relationship latency, unmanaged sampled demand, initial migration count,
+then node ID. PMU,
 uncore, SPE, application throughput, latency, and YBA profiles are excluded
 from online decisions.
 

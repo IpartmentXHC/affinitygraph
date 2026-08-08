@@ -66,6 +66,9 @@ void HardwareGraph::load_calibration(const std::string &path) {
     int from = std::stoi(cells[0]), to = std::stoi(cells[1]);
     double distance = std::stod(cells[3]), handoff = std::stod(cells[4]);
     node_distance[{from, to}] = distance;
+    node_calibration[{from, to}] = {
+        handoff, std::stod(cells[5]), std::stod(cells[6]), std::stod(cells[7]),
+        std::stod(cells[8]), std::stod(cells[9])};
     for (const auto &a : cpus) for (const auto &b : cpus)
       if (a.node == from && b.node == to) cpu_latency[{a.id, b.id}] = a.id == b.id ? 0.0 : handoff;
     ++loaded;
@@ -76,6 +79,7 @@ void HardwareGraph::load_calibration(const std::string &path) {
 }
 
 double HardwareGraph::latency(int from_cpu, int to_cpu) const {
+  if (from_cpu == to_cpu) return 0.0;
   if (auto it = cpu_latency.find({from_cpu, to_cpu}); it != cpu_latency.end()) return it->second;
   int from_node = -1, to_node = -1;
   for (const auto &cpu : cpus) {

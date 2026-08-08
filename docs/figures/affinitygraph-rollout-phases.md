@@ -50,13 +50,15 @@ INPUT:
 - current placement and migration budget
 
 PROCESS:
-- solver: NUMA partition + FM refinement
-- LPT singleton CPU assignment + local swaps
-- confidence, dwell, three-window confirmation
+- solver: one-time node planning with demand + thread-count capacity
+- whole initial plan confirmation and virtual budgeted pin batches
+- incremental dirty frontier and bounded local move/swap
+- per-action confirmation and per-thread dwell
 - capacity and migration validation
 
 OUTPUT:
 - proposed per-TID CPU assignments
+- isolated multi-window shadow placement
 - objective values + confidence
 - **actions = 0**
 - large explicit badge: **NO sched_setaffinity**

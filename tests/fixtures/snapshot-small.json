@@ -1,0 +1,29 @@
+{
+  "schema": "affinitygraph.snapshot.v1",
+  "window_id": "fixture-1",
+  "topology": {
+    "cpus": [
+      {"id": 0, "node": 0, "online": true},
+      {"id": 1, "node": 0, "online": true},
+      {"id": 2, "node": 1, "online": true},
+      {"id": 3, "node": 1, "online": true}
+    ],
+    "node_distances": [
+      {"from_node": 0, "to_node": 0, "distance": 10},
+      {"from_node": 0, "to_node": 1, "distance": 20},
+      {"from_node": 1, "to_node": 0, "distance": 20},
+      {"from_node": 1, "to_node": 1, "distance": 10}
+    ],
+    "cpu_latencies": []
+  },
+  "threads": [
+    {"tgid": 7, "tid": 11, "starttime": 101, "group": "worker", "demand": 0.4, "confidence": 1.0, "current_cpu": 0},
+    {"tgid": 7, "tid": 12, "starttime": 102, "group": "worker", "demand": 0.3, "confidence": 1.0, "current_cpu": 1},
+    {"tgid": 7, "tid": 13, "starttime": 103, "group": "merge", "demand": 0.2, "confidence": 1.0, "current_cpu": 2},
+    {"tgid": 7, "tid": 14, "starttime": 104, "group": "merge", "demand": 0.1, "confidence": 1.0, "current_cpu": 3}
+  ],
+  "edges": [
+    {"from_tid": 11, "to_tid": 12, "activity": 1.0, "sync": 1.0, "share": 0.0, "stability": 1.0, "score": 10.0},
+    {"from_tid": 13, "to_tid": 14, "activity": 1.0, "sync": 1.0, "share": 0.0, "stability": 1.0, "score": 10.0}
+  ]
+}

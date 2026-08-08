@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 
 namespace affinitygraph {
@@ -35,6 +36,8 @@ struct BpfReaderStats {
   uint64_t max_lag_ns = 0;
   uint64_t futex_aggregate_records = 0;
   uint64_t futex_handoffs = 0;
+  uint64_t vfs_aggregate_records = 0;
+  uint64_t vfs_handoffs = 0;
 };
 
 struct LifecycleRecord {
@@ -69,15 +72,45 @@ public:
   void resume();
 
 private:
+  struct PendingRelationKey {
+    ag_u32 kind = 0;
+    ag_u32 tgid = 0;
+    ag_u32 tid = 0;
+    ag_u32 peer_tid = 0;
+    ag_u64 start_time_ns = 0;
+    ag_u64 peer_start_time_ns = 0;
+
+    bool operator==(const PendingRelationKey &) const = default;
+  };
+
+  struct PendingRelationHash {
+    size_t operator()(const PendingRelationKey &key) const noexcept;
+  };
+
+  struct PendingRelationValue {
+    ag_u64 timestamp_ns = 0;
+    ag_u64 value_ns = 0;
+  };
+
+  struct PendingHealthSample {
+    uint64_t timestamp_ns = 0;
+    BpfHealthSnapshot health;
+    BpfReaderStats reader_stats;
+  };
+
   void run();
+  void run_bpf();
   void reconcile_and_sample();
   void maybe_solve(uint64_t now);
+  void solve_numa_domains(
+      const std::string &window_id, const std::vector<ThreadDemand> &demands,
+      const std::vector<RelationEdge> &edges,
+      const std::map<int, std::vector<int>> &allowed_masks, uint64_t now);
   void open_control_socket();
   void service_control_socket();
-  void consume_bpf_events();
-  void consume_bpf_futex_aggregates();
+  void drain_bpf_once();
+  void consume_pending_bpf();
   void handle_bpf_event(const affinitygraph_bpf_event &event);
-  void inherit_group_plan(int tid);
   void sample_bpf_health(uint64_t now);
   void trigger_fatal(const std::string &message);
   void log(const std::string &type, const std::string &fields = "");
@@ -94,17 +127,28 @@ private:
   std::shared_ptr<BpfRingReader> bpf_reader_;
   LinuxAffinityBackend backend_;
   Actuator actuator_;
+  IncrementalSolver solver_;
+  NumaDomainSolver domain_solver_;
   mutable std::mutex mutex_;
+  std::mutex bpf_pending_mutex_;
+  std::deque<affinitygraph_bpf_event> pending_lifecycle_events_;
+  std::unordered_map<PendingRelationKey, PendingRelationValue,
+                     PendingRelationHash> pending_relations_;
+  std::deque<PendingHealthSample> pending_health_samples_;
+  uint64_t pending_lifecycle_overflow_ = 0;
+  uint64_t pending_relation_overflow_ = 0;
+  uint64_t pending_relation_started_ns_ = 0;
+  uint64_t last_bpf_health_sample_ns_ = 0;
   std::unordered_map<int, LifecycleRecord> lifecycle_;
   std::map<int, std::vector<int>> pending_application_masks_;
   std::set<int> target_tgids_;
   std::map<int, int> current_plan_;
-  std::map<std::string, std::vector<int>> group_plan_;
-  std::map<std::string, size_t> group_cursor_;
-  ActiveCohort proposal_cohort_;
-  int proposal_count_ = 0;
+  std::map<int, std::vector<int>> current_masks_;
+  std::set<int> active_cohort_;
+  bool selector_ready_ = false;
   uint64_t last_solve_ns_ = 0;
-  uint64_t last_action_ns_ = 0;
+  uint64_t runtime_instance_id_ = 0;
+  uint64_t solve_window_sequence_ = 0;
   uint64_t collector_failed_since_ns_ = 0;
   BpfHealthSnapshot bpf_health_;
   BpfReaderStats bpf_reader_stats_;
@@ -122,15 +166,18 @@ private:
   RestoreResult last_restore_;
   std::atomic<bool> stopping_{false};
   std::atomic<bool> paused_{false};
+  std::thread bpf_worker_;
   std::thread worker_;
   int control_fd_ = -1;
   int log_fd_ = -1;
 };
 
 std::shared_ptr<BpfRingReader> make_bpf_reader(int events_fd, int health_fd,
-                                               int futex_aggregates_fd);
+                                               int futex_aggregates_fd,
+                                               int vfs_aggregates_fd);
 std::vector<affinitygraph_bpf_event> drain_bpf_events(BpfRingReader &reader);
 std::vector<affinitygraph_bpf_event> drain_bpf_futex_aggregates(BpfRingReader &reader);
+std::vector<affinitygraph_bpf_event> drain_bpf_vfs_aggregates(BpfRingReader &reader);
 BpfHealthSnapshot bpf_reader_health(BpfRingReader &reader);
 BpfReaderStats bpf_reader_stats(BpfRingReader &reader);
 

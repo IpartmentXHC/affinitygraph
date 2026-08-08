@@ -99,23 +99,29 @@ Identity resolve_identity(const std::string &user) {
   return {uid, static_cast<gid_t>(std::stoul(gid_text)), entry ? entry->pw_name : ""};
 }
 
-bool drop_identity(const Identity &identity, bool retain_sys_nice = false) {
+bool drop_identity(const Identity &identity, bool retain_sys_nice = false,
+                   bool retain_sys_ptrace = false) {
   if (geteuid() != 0) return false;
   if (!identity.name.empty() && initgroups(identity.name.c_str(), identity.gid) != 0)
     throw std::runtime_error("initgroups failed: " + std::string(std::strerror(errno)));
-  if (retain_sys_nice && prctl(PR_SET_KEEPCAPS, 1L) != 0)
-    throw std::runtime_error("cannot retain active supervisor capability");
+  const bool retain_capabilities = retain_sys_nice || retain_sys_ptrace;
+  if (retain_capabilities && prctl(PR_SET_KEEPCAPS, 1L) != 0)
+    throw std::runtime_error("cannot retain supervisor capabilities");
   if (setgid(identity.gid) != 0 || setuid(identity.uid) != 0)
     throw std::runtime_error("failed to drop bootstrap privileges");
-  if (retain_sys_nice) {
+  if (retain_capabilities) {
     __user_cap_header_struct header{_LINUX_CAPABILITY_VERSION_3, 0};
     __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3]{};
-    constexpr unsigned word = CAP_SYS_NICE / 32;
-    constexpr __u32 mask = 1U << (CAP_SYS_NICE % 32);
-    data[word].effective = mask;
-    data[word].permitted = mask;
+    auto add_capability = [&](int capability) {
+      const unsigned word = static_cast<unsigned>(capability) / 32;
+      const __u32 mask = 1U << (capability % 32);
+      data[word].effective |= mask;
+      data[word].permitted |= mask;
+    };
+    if (retain_sys_nice) add_capability(CAP_SYS_NICE);
+    if (retain_sys_ptrace) add_capability(CAP_SYS_PTRACE);
     if (syscall(SYS_capset, &header, data) != 0 || prctl(PR_SET_KEEPCAPS, 0L) != 0)
-      throw std::runtime_error("cannot configure CAP_SYS_NICE for active supervisor");
+      throw std::runtime_error("cannot configure supervisor capabilities");
   }
   return retain_sys_nice;
 }
@@ -227,8 +233,10 @@ public:
     events_fd_ = map_fd("events");
     health_fd_ = map_fd("health");
     futex_aggregates_fd_ = map_fd("futex_aggregates");
-    if (pids_fd_ < 0 || events_fd_ < 0 || health_fd_ < 0 || futex_aggregates_fd_ < 0) {
-      reason = "BPF object is missing pids/events/health/futex_aggregates maps";
+    vfs_aggregates_fd_ = map_fd("vfs_aggregates");
+    if (pids_fd_ < 0 || events_fd_ < 0 || health_fd_ < 0 ||
+        futex_aggregates_fd_ < 0 || vfs_aggregates_fd_ < 0) {
+      reason = "BPF object is missing required data maps";
       return false;
     }
     reason = "CO-RE programs loaded and attached with libbpf";
@@ -279,6 +287,7 @@ public:
   int events_fd() const { return events_fd_; }
   int health_fd() const { return health_fd_; }
   int futex_aggregates_fd() const { return futex_aggregates_fd_; }
+  int vfs_aggregates_fd() const { return vfs_aggregates_fd_; }
 
   void reset() {
     for (auto it = links_.rbegin(); it != links_.rend(); ++it) api_.destroy_link(*it);
@@ -287,7 +296,8 @@ public:
     object_ = nullptr;
     pthread_entry_ = nullptr;
     pthread_return_ = nullptr;
-    pids_fd_ = events_fd_ = health_fd_ = futex_aggregates_fd_ = -1;
+    pids_fd_ = events_fd_ = health_fd_ = futex_aggregates_fd_ =
+        vfs_aggregates_fd_ = -1;
   }
 
   ~BpfSession() { reset(); }
@@ -306,6 +316,7 @@ private:
   int events_fd_ = -1;
   int health_fd_ = -1;
   int futex_aggregates_fd_ = -1;
+  int vfs_aggregates_fd_ = -1;
 };
 
 bool bpf_available(const std::string &object, std::string &reason) {
@@ -440,7 +451,8 @@ int supervise(const Arguments &args, Config config) {
   }
   bool affinity_capability = false;
   try {
-    affinity_capability = drop_identity(identity, config.mode == Mode::Active);
+    affinity_capability = drop_identity(identity, config.mode == Mode::Active,
+                                        true);
     if (config.mode == Mode::Active) {
       LinuxAffinityBackend affinity;
       auto original = affinity.get(child);
@@ -458,7 +470,8 @@ int supervise(const Arguments &args, Config config) {
     throw;
   }
   auto reader = bpf_ready ? make_bpf_reader(
-      bpf.events_fd(), bpf.health_fd(), bpf.futex_aggregates_fd()) : nullptr;
+      bpf.events_fd(), bpf.health_fd(), bpf.futex_aggregates_fd(),
+      bpf.vfs_aggregates_fd()) : nullptr;
   Runtime runtime(std::move(config), child, std::move(reader), !bpf_ready,
                   std::move(uprobe_status), affinity_capability);
 

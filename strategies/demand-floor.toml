@@ -1,0 +1,6 @@
+schema = "affinitygraph.strategy.v1"
+id = "demand-floor"
+demand_floor = 0.001
+maximum_migrated_active_threads_ratio = 0.25
+fm_passes = 4
+seed = 20260805

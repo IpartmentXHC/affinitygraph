@@ -1,0 +1,7 @@
+schema = "affinitygraph.strategy.v1"
+id = "dynamic-slot-cap"
+max_threads_per_cpu = 0
+slot_slack = 2
+maximum_migrated_active_threads_ratio = 0.25
+fm_passes = 4
+seed = 20260805

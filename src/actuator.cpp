@@ -38,33 +38,74 @@ void Actuator::note_inherited_mask(int tid, int parent_tid,
   restore_masks_[tid] = parent == restore_masks_.end() ? observed_cpus : parent->second;
 }
 
-ApplyResult Actuator::apply(const Placement &placement, const std::set<int> &live_tids) {
+namespace {
+ApplyResult apply_delta(AffinityBackend &backend,
+                        std::map<int, std::vector<int>> &restore_masks,
+                        std::set<int> &acted_tids,
+                        const std::map<int, std::vector<int>> &assignments,
+                        const std::set<int> &live_tids) {
   ApplyResult result;
-  result.requested = placement.tid_to_cpu.size();
+  result.requested = assignments.size();
   std::vector<int> completed;
-  for (const auto &[tid, cpu] : placement.tid_to_cpu) {
-    if (!live_tids.contains(tid)) { ++result.vanished; continue; }
-    if (!restore_masks_.contains(tid)) restore_masks_[tid] = backend_.get(tid);
+  std::map<int, std::vector<int>> previous_masks;
+  std::map<int, bool> previously_acted;
+  for (const auto &[tid, cpus] : assignments) {
+    if (!live_tids.contains(tid)) {
+      ++result.vanished;
+      result.vanished_tids.insert(tid);
+      continue;
+    }
+    previous_masks[tid] = backend.get(tid);
+    previously_acted[tid] = acted_tids.contains(tid);
+    if (!restore_masks.contains(tid)) restore_masks[tid] = previous_masks[tid];
     int error = 0;
-    if (!backend_.set(tid, {cpu}, error)) {
-      if (error == ESRCH) { ++result.vanished; continue; }
+    if (cpus.empty() || !backend.set(tid, cpus, error)) {
+      if (cpus.empty()) error = EINVAL;
+      if (error == ESRCH) {
+        ++result.vanished;
+        result.vanished_tids.insert(tid);
+        continue;
+      }
       result.error = error;
       for (auto it = completed.rbegin(); it != completed.rend(); ++it) {
         int ignored = 0;
-        if (backend_.set(*it, restore_masks_[*it], ignored) || ignored == ESRCH) {
+        if (backend.set(*it, previous_masks[*it], ignored) || ignored == ESRCH) {
           ++result.rolled_back;
-          acted_tids_.erase(*it);
+          if (!previously_acted[*it]) acted_tids.erase(*it);
         } else result.rollback_success = false;
       }
       return result;
     }
     completed.push_back(tid);
-    acted_tids_.insert(tid);
+    acted_tids.insert(tid);
     ++result.applied;
   }
   result.success = true;
   result.committed = result.applied;
+  result.committed_tids.insert(completed.begin(), completed.end());
   return result;
+}
+
+std::map<int, std::vector<int>> singleton_masks(
+    const std::map<int, int> &assignments) {
+  std::map<int, std::vector<int>> result;
+  for (const auto &[tid, cpu] : assignments) result[tid] = {cpu};
+  return result;
+}
+} // namespace
+
+ApplyResult Actuator::apply(const Placement &placement,
+                            const std::set<int> &live_tids) {
+  return apply_delta(backend_, restore_masks_, acted_tids_,
+                     singleton_masks(placement.tid_to_cpu), live_tids);
+}
+
+ApplyResult Actuator::apply(const PlacementDelta &placement,
+                            const std::set<int> &live_tids) {
+  auto masks = placement.tid_to_mask;
+  for (const auto &[tid, cpu] : placement.tid_to_cpu)
+    if (!masks.contains(tid)) masks[tid] = {cpu};
+  return apply_delta(backend_, restore_masks_, acted_tids_, masks, live_tids);
 }
 
 RestoreResult Actuator::restore_all() {
@@ -79,6 +120,27 @@ RestoreResult Actuator::restore_all() {
   }
   acted_tids_.clear();
   restore_masks_.clear();
+  return result;
+}
+
+RestoreResult Actuator::restore(const std::set<int> &tids) {
+  RestoreResult result;
+  for (int tid : tids) {
+    if (!acted_tids_.contains(tid)) continue;
+    ++result.requested;
+    int error = 0;
+    if (backend_.set(tid, restore_masks_.at(tid), error)) {
+      ++result.restored;
+      acted_tids_.erase(tid);
+      restore_masks_.erase(tid);
+    } else if (error == ESRCH) {
+      ++result.vanished;
+      acted_tids_.erase(tid);
+      restore_masks_.erase(tid);
+    } else {
+      ++result.failed;
+    }
+  }
   return result;
 }
 

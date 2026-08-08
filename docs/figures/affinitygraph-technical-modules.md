@@ -44,7 +44,7 @@ INPUT:
 PROCESS:
 - libbpf loads and polls CO-RE programs
 - BPF map aggregates cross-TID futex handoffs per window
-- 16 MiB ring buffer transports bounded events
+- 4 MiB ring buffer transports bounded events; a dedicated worker drains every 50 ms
 - health-map counts emitted / dropped / suppressed by event type
 - compute rolling 30 s loss ratio
 - Supervisor poll telemetry: batch size, occupancy, lag, CPU/RSS
@@ -67,16 +67,18 @@ INPUT:
 - hardware latency graph, current placement, migration budget
 
 PROCESS:
-- capacity-constrained NUMA graph partitioning
-- FM refinement
-- LPT CPU assignment + local swaps
-- confidence, dwell, and three-window confirmation
+- one-time node-level planning with demand + thread-count capacity
+- whole initial node-plan confirmation, then budgeted singleton pin batches
+- incremental dirty frontier + dissatisfaction ranking
+- bounded local move/swap solver (at most 64 exact candidates)
+- per-action confirmation and per-thread dwell
 - lexicographic objective: overload -> relationship latency -> migration cost
 
 OUTPUT:
 - per-TID singleton CPU plan
 - objective components
 - migration decisions and confidence
+- committed placement in active / isolated shadow placement in plan
 
 Place a small schematic in the module: a thread relationship graph maps through NUMA partitions to individual CPU boxes. Label the transition **solver**. Make clear this module generates a plan but does not itself change affinity.
 

@@ -1,0 +1,6 @@
+schema = "affinitygraph.strategy.v1"
+id = "thread-count-tiebreak"
+tie_break_policy = "thread_count"
+maximum_migrated_active_threads_ratio = 0.25
+fm_passes = 4
+seed = 20260805

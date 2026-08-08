@@ -14,7 +14,7 @@
 #define S_IFMT 00170000
 #define S_IFIFO 0010000
 #define S_IFCHR 0020000
-#define RING_BYTES (16U << 20)
+#define RING_BYTES (4U << 20)
 #define RENAME_MIN_INTERVAL_NS 500000000ULL
 
 static void *(*bpf_map_lookup_elem)(void *, const void *) = (void *)BPF_FUNC_map_lookup_elem;
@@ -75,10 +75,17 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 65536);
+  __uint(max_entries, AFFINITYGRAPH_FUTEX_AGGREGATE_MAX_ENTRIES);
   __type(key, struct affinitygraph_futex_key);
   __type(value, struct affinitygraph_futex_value);
 } futex_aggregates SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, AFFINITYGRAPH_VFS_AGGREGATE_MAX_ENTRIES);
+  __type(key, struct affinitygraph_vfs_key);
+  __type(value, struct affinitygraph_vfs_value);
+} vfs_aggregates SEC(".maps");
 
 struct resource_key { __u32 tgid; __u32 device; __u64 inode; };
 struct resource_value { __u32 tid; __u64 timestamp_ns; __u64 start_time_ns; };
@@ -387,14 +394,27 @@ static __always_inline int account_fd(struct trace_event_raw_sys_enter *ctx) {
   __u64 now = bpf_ktime_get_boot_ns();
   __u64 generation = task_start_time(task);
   if (previous && previous->tid != tid) {
-    struct affinitygraph_bpf_event event = {
-      .kind = AFFINITYGRAPH_VFS, .tgid = tgid, .tid = tid,
-      .peer_tid = previous->tid, .start_time_ns = generation,
+    struct affinitygraph_vfs_key aggregate_key = {
+      .tgid = tgid, .tid = tid, .peer_tid = previous->tid,
+      .start_time_ns = generation,
       .peer_start_time_ns = previous->start_time_ns,
-      .value_ns = now > previous->timestamp_ns ? now - previous->timestamp_ns : 0,
       .resource = key.inode,
     };
-    emit_event(&event);
+    __u64 elapsed = now > previous->timestamp_ns ? now - previous->timestamp_ns : 0;
+    struct affinitygraph_vfs_value *aggregate =
+        bpf_map_lookup_elem(&vfs_aggregates, &aggregate_key);
+    long result = 0;
+    if (aggregate) {
+      __sync_fetch_and_add(&aggregate->total_time_ns, elapsed);
+      __sync_fetch_and_add(&aggregate->count, 1);
+      aggregate->last_timestamp_ns = now;
+    } else {
+      struct affinitygraph_vfs_value value = {
+        .total_time_ns = elapsed, .count = 1, .last_timestamp_ns = now,
+      };
+      result = bpf_map_update_elem(&vfs_aggregates, &aggregate_key, &value, BPF_ANY);
+    }
+    account_emit(AFFINITYGRAPH_VFS, result);
   }
   struct resource_value next = {.tid = tid, .timestamp_ns = now, .start_time_ns = generation};
   bpf_map_update_elem(&resources, &key, &next, BPF_ANY);

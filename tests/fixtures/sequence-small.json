@@ -1,0 +1,13 @@
+{
+  "schema": "affinitygraph.replay-sequence.v1",
+  "frames": [
+    {"timestamp_ns": 10000000000, "snapshot": "snapshot-small.json"},
+    {"timestamp_ns": 20000000000, "snapshot": "snapshot-small.json"},
+    {"timestamp_ns": 30000000000, "snapshot": "snapshot-small.json"},
+    {"timestamp_ns": 40000000000, "snapshot": "snapshot-small.json"},
+    {"timestamp_ns": 50000000000, "snapshot": "snapshot-small.json"},
+    {"timestamp_ns": 60000000000, "snapshot": "snapshot-small.json"},
+    {"timestamp_ns": 70000000000, "snapshot": "snapshot-small.json"},
+    {"timestamp_ns": 80000000000, "snapshot": "snapshot-small.json"}
+  ]
+}

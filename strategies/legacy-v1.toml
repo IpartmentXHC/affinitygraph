@@ -1,0 +1,6 @@
+schema = "affinitygraph.strategy.v1"
+id = "legacy-v1"
+maximum_migrated_active_threads_ratio = 0.25
+active_threshold = 0.05
+fm_passes = 4
+seed = 0
