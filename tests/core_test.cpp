@@ -449,6 +449,86 @@ void test_numa_domain_dwell_holds_transient_relation_gap() {
   solver.discard(expired);
 }
 
+void test_numa_domain_recent_evidence_refreshes_release_dwell() {
+  auto h = hardware();
+  std::vector<ThreadDemand> threads{
+      {{1, 1, 1}, "family-a", 0.6, 1, 0},
+      {{1, 2, 2}, "family-a", 0.6, 1, 1},
+      {{1, 3, 3}, "family-b", 0.6, 1, 2},
+      {{1, 4, 4}, "family-b", 0.6, 1, 3},
+  };
+  std::vector<RelationEdge> edges{
+      {1, 2, 0, 0, 0, 1, 10},
+      {3, 4, 0, 0, 0, 1, 2},
+      {1, 3, 0, 0, 0, 1, 8},
+  };
+  NumaDomainOptions options;
+  options.family_stability_confirmations = 1;
+  options.domain_stability_confirmations = 1;
+  options.plan_confirmations = 1;
+  options.minimum_dwell_ns = 100;
+  NumaDomainSolver solver;
+
+  auto initial = solver.propose(h, threads, edges, {}, options, 10);
+  solver.commit(initial, 10);
+
+  // placement 已远早于 dwell，但完整关系证据刚被再次确认。
+  auto reconfirmed = solver.propose(h, threads, edges, {}, options, 1000);
+  require(reconfirmed.ready && reconfirmed.domains.size() == 1 &&
+              reconfirmed.domains[0].node_decision == "stable",
+          "stable evidence reconfirms an old committed domain");
+  solver.commit(reconfirmed, 1000);
+
+  auto idle_threads = threads;
+  for (auto &thread : idle_threads) thread.demand = 0;
+  auto held = solver.propose(h, idle_threads, {}, {}, options, 1050);
+  require(held.ready && held.domains.size() == 1 &&
+              held.domains[0].families ==
+                  std::vector<std::string>({"family-a", "family-b"}) &&
+              held.domains[0].node_decision == "held_domain_dwell",
+          "recent complete evidence holds a domain despite old placement");
+  solver.commit(held, 1050);
+
+  auto expired = solver.propose(h, idle_threads, {}, {}, options, 1101);
+  require(expired.ready && expired.domains.empty() &&
+              expired.released_tids == std::set<int>({1, 2, 3, 4}),
+          "domain releases after continuous evidence absence reaches dwell");
+  solver.discard(expired);
+}
+
+void test_numa_domain_capacity_dwell_uses_node_change_time() {
+  HardwareGraph h;
+  for (int cpu = 0; cpu < 8; ++cpu) h.cpus.push_back({cpu, cpu / 4, true});
+  std::vector<ThreadDemand> threads;
+  for (int tid = 1; tid <= 4; ++tid)
+    threads.push_back({{1, tid, static_cast<uint64_t>(tid)}, "family-a", 1.0,
+                       1, tid - 1});
+  const std::vector<RelationEdge> edges{
+      {1, 2, 0, 0, 0, 1, 5}, {2, 3, 0, 0, 0, 1, 5},
+      {3, 4, 0, 0, 0, 1, 5}};
+  NumaDomainOptions options;
+  options.family_stability_confirmations = 1;
+  options.plan_confirmations = 1;
+  options.shrink_confirmations = 1;
+  options.minimum_dwell_ns = 100;
+  NumaDomainSolver solver;
+
+  auto initial = solver.propose(h, threads, edges, {}, options, 10);
+  require(initial.domains[0].target_nodes.size() == 2,
+          "capacity fixture initially needs two nodes");
+  solver.commit(initial, 10);
+  auto reconfirmed = solver.propose(h, threads, edges, {}, options, 1000);
+  solver.commit(reconfirmed, 1000);
+
+  for (auto &thread : threads) thread.demand = 0.5;
+  auto shrunk = solver.propose(h, threads, edges, {}, options, 1001);
+  require(shrunk.ready && shrunk.domains.size() == 1 &&
+              shrunk.domains[0].target_nodes.size() == 1 &&
+              shrunk.domains[0].node_decision == "shrunk",
+          "capacity shrink dwell remains tied to the last node change");
+  solver.discard(shrunk);
+}
+
 void test_numa_domain_dwell_allows_superset_merge() {
   auto h = hardware();
   NumaDomainOptions options;
@@ -1147,6 +1227,8 @@ int main() {
     test_numa_domain_clickhouse_negative_control();
     test_numa_domain_pending_merge_suppresses_singleton();
     test_numa_domain_dwell_holds_transient_relation_gap();
+    test_numa_domain_recent_evidence_refreshes_release_dwell();
+    test_numa_domain_capacity_dwell_uses_node_change_time();
     test_numa_domain_dwell_allows_superset_merge();
     test_numa_domain_aggregates_before_family_pruning();
     test_numa_domain_capacity_atomicity_and_envelope();

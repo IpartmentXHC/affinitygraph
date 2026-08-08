@@ -434,7 +434,10 @@ private:
   int global_plan_confirmation_ = 0;
   std::map<std::string, int> expand_confirmations_;
   std::map<std::string, int> shrink_confirmations_;
+  // 节点变更时间只约束容量扩缩；完整 domain 证据时间单独约束关系低谷时
+  // 是否保留 family 集合，避免长期稳定 domain 在一次 phase gap 后被拆散。
   std::map<std::string, uint64_t> last_changed_ns_;
+  std::map<std::string, uint64_t> last_confirmed_domain_evidence_ns_;
   std::map<std::string, std::vector<int>> domain_nodes_;
   std::map<int, std::vector<int>> placement_;
   std::vector<NumaDomain> domains_;

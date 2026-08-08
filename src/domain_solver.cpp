@@ -464,14 +464,36 @@ NumaDomainProposal NumaDomainSolver::propose(
     proposal.domains.push_back(std::move(domain));
   }
 
+  // evidence candidate 是经过 family/pair 稳定确认后得到的无状态 domain。
+  // 它完整覆盖已提交 domain 时，刷新“最近完整关系证据”；该时间与 node mask
+  // 最近变更时间必须分离，否则运行超过 minimum_dwell 后的第一个短暂低谷会
+  // 立即拆散一个刚刚仍被证据确认的 domain。
+  for (const auto &committed : domains_) {
+    const bool complete_evidence = std::any_of(
+        proposal.domains.begin(), proposal.domains.end(),
+        [&](const auto &candidate) {
+          return candidate.valid &&
+                 std::all_of(
+                     committed.families.begin(), committed.families.end(),
+                     [&](const auto &family) {
+                       return std::find(candidate.families.begin(),
+                                        candidate.families.end(), family) !=
+                              candidate.families.end();
+                     });
+        });
+    if (complete_evidence)
+      last_confirmed_domain_evidence_ns_[committed.id] = now_ns;
+  }
+
   // 已提交 domain 的 dwell 约束作用于完整 family domain，而不仅是 node 数量。
   // workload phase 切换时关系边和 demand 会短暂消失；若此时把联合 domain
   // 降成 singleton，再在下一阶段重建，会制造一次无意义的 restore/bind 抖动。
   // 只要成员仍在线且应用 mask 仍兼容，在 dwell 内保留原 domain 和 node mask。
   for (const auto &committed : domains_) {
-    const auto changed = last_changed_ns_.find(committed.id);
-    if (changed == last_changed_ns_.end() ||
-        now_ns - changed->second >= options.minimum_dwell_ns)
+    const auto confirmed =
+        last_confirmed_domain_evidence_ns_.find(committed.id);
+    if (confirmed == last_confirmed_domain_evidence_ns_.end() ||
+        now_ns - confirmed->second >= options.minimum_dwell_ns)
       continue;
     // 已确认候选若完整包含当前 family（例如 singleton 升级为联合 domain），
     // 允许升级；dwell 只阻止丢失 family 的降级或拆分。
@@ -642,9 +664,16 @@ void NumaDomainSolver::commit(const NumaDomainProposal &proposal,
       continue;
     placement_[action.identity.tid] = action.target_mask;
   }
+  std::set<std::string> previously_active_domains;
+  for (const auto &domain : domains_)
+    previously_active_domains.insert(domain.id);
   for (const auto &domain : proposal.domains) {
     if (domain_nodes_[domain.id] != domain.target_nodes)
       last_changed_ns_[domain.id] = now_ns;
+    // 新 domain 的 commit 来自已确认 plan，因此此刻也是它第一份完整证据。
+    // held_domain_dwell 的后续 commit 不会进入此分支，不能借 commit 人为续期。
+    if (!previously_active_domains.contains(domain.id))
+      last_confirmed_domain_evidence_ns_[domain.id] = now_ns;
     domain_nodes_[domain.id] = domain.target_nodes;
   }
   domains_ = proposal.domains;
