@@ -1,0 +1,25 @@
+[cloud]
+host = "kunpen183"
+user = "xhc"
+project_root = "/home/xhc/.local/share/affinitygraph"
+release_root = "/home/xhc/.local/share/affinitygraph/releases"
+experiment_root = "/home/xhc/.local/share/affinitygraph/experiments"
+
+[local]
+project_root = "/data/threadState/affinitygraph"
+workspace_experiment_root = "/data/threadState/experiments"
+archive_root = "/data/threadState/affinitygraph-archive"
+
+[archive]
+local_experiment_days = 15
+compress = "zstd"
+verify_after_compress = true
+delete_source_after_verify = false
+
+[build]
+cxx = "/usr/bin/clang++-18"
+clang = "/usr/bin/clang-18"
+jobs = 8
+
+[sudo]
+askpass_config = "/home/xhc/.config/affinitygraph/config.env"

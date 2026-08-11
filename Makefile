@@ -11,7 +11,9 @@ CORE_SOURCES := src/config.cpp src/topology.cpp src/collector.cpp src/graph.cpp 
 CORE_OBJECTS := $(CORE_SOURCES:%.cpp=$(BUILD)/%.o)
 RUNTIME_OBJECTS := $(BUILD)/src/runtime.o $(BUILD)/src/bpf_reader.o
 
-.PHONY: all test runtime-test clean install bpf
+.PHONY: all test runtime-test clean install bpf \
+	ops-env-check ops-local-test ops-cloud-build ops-cloud-preflight \
+	ops-archive-dry ops-archive-apply ops-cloud-clean-dry ops-cloud-clean-apply
 
 all: $(BUILD)/affinity-run $(BUILD)/affinityctl $(BUILD)/affinity-replay $(BUILD)/affinity-domain-replay $(BUILD)/affinitygraph-tests $(BUILD)/supervisor-test $(BUILD)/bpf-lifecycle-test
 
@@ -86,3 +88,30 @@ install: all
 	install -D -m 0644 THIRD_PARTY_NOTICES.md $(DESTDIR)/usr/share/doc/affinitygraph/THIRD_PARTY_NOTICES.md
 	install -D -m 0644 docs/operations.md $(DESTDIR)/usr/share/doc/affinitygraph/operations.md
 	@if test -f $(BUILD)/affinitygraph.bpf.o; then install -D -m 0644 $(BUILD)/affinitygraph.bpf.o $(DESTDIR)/usr/lib/affinitygraph/affinitygraph.bpf.o; fi
+
+ops-env-check:
+	./scripts/ops/env-check.sh
+
+ops-local-test:
+	./scripts/ops/local-test.sh
+
+ops-cloud-build:
+	./scripts/ops/cloud-build.sh
+
+ops-cloud-preflight:
+	@test -n "$(CONFIG)" || { echo "CONFIG=<config.toml> is required" >&2; exit 2; }
+	./scripts/ops/cloud-preflight.sh --config "$(CONFIG)" $(if $(RELEASE),--release "$(RELEASE)",)
+
+ops-archive-dry:
+	./scripts/ops/experiment-archive.sh --dry-run
+
+ops-archive-apply:
+	@test -n "$(CONFIRM_PLAN_SHA256)" || { echo "CONFIRM_PLAN_SHA256 is required" >&2; exit 2; }
+	./scripts/ops/experiment-archive.sh --apply --confirm-plan-sha256 "$(CONFIRM_PLAN_SHA256)"
+
+ops-cloud-clean-dry:
+	./scripts/ops/cloud-clean.sh --dry-run
+
+ops-cloud-clean-apply:
+	@test -n "$(CONFIRM_PLAN_SHA256)" || { echo "CONFIRM_PLAN_SHA256 is required" >&2; exit 2; }
+	./scripts/ops/cloud-clean.sh --apply --confirm-plan-sha256 "$(CONFIRM_PLAN_SHA256)"

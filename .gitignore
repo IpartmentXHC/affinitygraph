@@ -43,3 +43,8 @@ Thumbs.db
 .idea/
 *.swp
 *~
+
+# Local operations state and sensitive overrides.
+config/ops.local.toml
+.agent/setup/*.tsv
+.agent/setup/*.tmp
