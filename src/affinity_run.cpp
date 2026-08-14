@@ -33,12 +33,16 @@ struct Arguments {
   std::string config;
   std::string bpf_object;
   std::string user;
+  std::string thread_profile;
+  std::string profile_output;
+  std::string experiment_id;
+  std::string test_id;
   std::vector<char *> command;
 };
 
 Arguments parse(int argc, char **argv) {
   if (argc < 2)
-    throw std::runtime_error("usage: affinity-run preflight|run --config PATH [--bpf-object PATH] [--user USER] [-- command ...]");
+    throw std::runtime_error("usage: affinity-run preflight|run --config PATH [--thread-profile PATH] [--profile-output PATH] [--experiment-id ID] [--test-id ID] [--bpf-object PATH] [--user USER] [-- command ...]");
   Arguments args;
   args.action = argv[1];
   for (int i = 2; i < argc; ++i) {
@@ -47,11 +51,15 @@ Arguments parse(int argc, char **argv) {
       for (++i; i < argc; ++i) args.command.push_back(argv[i]);
       break;
     }
-    if ((arg == "--config" || arg == "--bpf-object" || arg == "--user") && i + 1 < argc) {
+    if ((arg == "--config" || arg == "--bpf-object" || arg == "--user" || arg == "--thread-profile" || arg == "--profile-output" || arg == "--experiment-id" || arg == "--test-id") && i + 1 < argc) {
       std::string value = argv[++i];
       if (arg == "--config") args.config = value;
       else if (arg == "--bpf-object") args.bpf_object = value;
-      else args.user = value;
+      else if (arg == "--user") args.user = value;
+      else if (arg == "--thread-profile") args.thread_profile = value;
+      else if (arg == "--profile-output") args.profile_output = value;
+      else if (arg == "--experiment-id") args.experiment_id = value;
+      else args.test_id = value;
     } else throw std::runtime_error("unknown or incomplete option: " + arg);
   }
   if (args.config.empty()) throw std::runtime_error("--config is required");
@@ -344,6 +352,7 @@ void install_signal_handlers() {
 
 int preflight(const Arguments &args) {
   Config config = load_config(args.config);
+  if (!args.thread_profile.empty()) load_thread_profile(args.thread_profile, config.cpus);
   auto available = current_envelope();
   bool ok = true;
   std::cout << "config: ok\n";
@@ -373,6 +382,10 @@ int preflight(const Arguments &args) {
 }
 
 int supervise(const Arguments &args, Config config) {
+  config.thread_profile_path = args.thread_profile;
+  config.profile_output_path = args.profile_output;
+  config.experiment_id = args.experiment_id;
+  config.test_id = args.test_id;
   if (!subset(config.cpus, current_envelope()))
     throw std::runtime_error("configured CPU envelope exceeds startup/cgroup affinity");
   if (args.command.empty()) throw std::runtime_error("run requires -- command ...");

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "profile_id": "runtime-only-empty",
+  "generated_at": "2026-08-12T00:00:00Z",
+  "status": "candidate",
+  "source": {
+    "commit": "runtime-only-control",
+    "experiment_id": "runtime-only-control",
+    "test_id": "C5T16"
+  },
+  "applicability": {
+    "description": "Telemetry-only control: no profile placement rules and no affinity actions.",
+    "similarity": {"metric": "", "threshold": null, "reported_gap": null}
+  },
+  "dynamic": {
+    "enabled": false,
+    "small_step_threads": 1,
+    "large_change_ratio": 0.30,
+    "large_step_threads": 4,
+    "cooldown_seconds": 10
+  },
+  "placements": []
+}

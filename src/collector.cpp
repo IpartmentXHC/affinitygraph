@@ -60,6 +60,11 @@ std::vector<ThreadSample> ProcCollector::sample(int tgid) const {
         try { sample.allowed_cpus = parse_cpu_list(body); } catch (...) {}
       }
     }
+    std::ifstream cgroup(entry.path() / "cgroup");
+    while (std::getline(cgroup, line)) {
+      auto colon = line.rfind(':');
+      if (colon != std::string::npos) sample.cgroups.push_back(line.substr(colon + 1));
+    }
     result.push_back(std::move(sample));
   }
   std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) { return a.identity.tid < b.identity.tid; });

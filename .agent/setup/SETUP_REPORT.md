@@ -19,7 +19,7 @@ git 状态：仅有本次 ops 入口、配置和报告改动；核心算法源�
 - 脚本目录：`scripts/ops/`
 - 配置文件：`config/ops.toml`
 - Makefile targets：`ops-env-check`、`ops-local-test`、`ops-cloud-build`、`ops-cloud-preflight`、`ops-archive-*`、`ops-cloud-clean-*`
-- 本地入口只做静态检查；所有编译和可执行测试均在 `kunpen183` 完成。
+- 本地入口只做静态检查；所有编译和可执行测试均在 `kunpen183` 完成，请求放在ubuntu197。
 - 最近不可变 release：`/home/xhc/.local/share/affinitygraph/releases/1a082f00d21c5b27`
 
 ## 3. 本地实验数据归档

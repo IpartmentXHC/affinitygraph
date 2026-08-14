@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profile_id": "example-per-thread",
+  "generated_at": "2026-08-11T00:00:00Z",
+  "status": "candidate",
+  "source": {"commit": "", "experiment_id": "", "test_id": ""},
+  "applicability": {"description": "Template only; replace matcher and CPUs after a short validation run.", "similarity": {"metric": "", "threshold": null, "reported_gap": null}},
+  "dynamic": {"enabled": true, "small_step_threads": 1, "large_change_ratio": 0.30, "large_step_threads": 4, "cooldown_seconds": 10},
+  "placements": [
+    {"id": "replace-me", "match": {"comm": "replace-me", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "0-127", "dynamic": true, "affinities": [{"cpus": "0", "count": 1}]}
+  ]
+}

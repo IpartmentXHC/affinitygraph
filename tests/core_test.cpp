@@ -1,5 +1,6 @@
 #include "affinitygraph/core.hpp"
 #include "affinitygraph/bpf_events.h"
+#include "affinitygraph/thread_profile.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -53,26 +54,47 @@ void test_cpu_lists() {
   require(test_config.pthread_uprobe,
           "pthread uprobe config parsed");
   auto production = load_config("config/affinitygraph.toml");
-  require(production.solver == "numa-domain-v1" &&
-              production.affinity_granularity == "numa_node_mask" &&
-              production.maximum_threads_per_domain == 1024 &&
-              production.family_edges_per_family == 4 &&
-              production.domain_minimum_dwell_seconds == 300 &&
-              production.initial_node_passes == 8 &&
-              production.initial_node_thread_slack_ratio == 0.5 &&
-              production.candidate_hard_limit == 64 &&
-              production.minimum_relative_gain == 0.05 &&
-              production.maximum_threads_per_cpu == 2 &&
-              production.thread_slot_slack == 0 &&
-              production.future_demand_floor == 0.02 &&
-              production.hotspot_edges_per_thread == 4 &&
-              production.hotspot_edge_quantile == 0.95 &&
-              production.hotspot_component_boost == 4.0 &&
-              production.maximum_managed_threads == 64 &&
-              production.managed_thread_hysteresis_ratio == 1.0 &&
-              production.inactive_demand_threshold == 0.0 &&
-              production.hotspot_replan_growth_ratio == 0.25,
-          "NUMA domain configuration parsed");
+  require(production.solver == "incremental-hotspot-v1" &&
+              production.affinity_granularity == "singleton_cpu" &&
+              production.solve_interval_seconds == 1 &&
+              production.proposal_confirmations == 2 &&
+              production.candidate_hard_limit == 4 &&
+              production.maximum_managed_threads == 128,
+          "per-thread configuration parsed");
+}
+
+void test_thread_profile() {
+  auto profile = load_thread_profile("tests/fixtures/thread-profile-small.json", {0, 1, 2, 3});
+  require(profile.placements.size() == 1 && profile.dynamic.large_step_threads == 4,
+          "thread profile loads");
+  ThreadSample worker = sample(10, 1, 0, 0);
+  worker.comm = "worker";
+  worker.cgroups = {"/job"};
+  std::map<std::string, size_t> instances;
+  std::map<ThreadIdentity, ProfileAssignment> assigned;
+  auto first = profile_assignment(profile, worker, instances, assigned);
+  require(first && first->target_cpus == std::vector<int>({0}), "first profile assignment");
+  worker.identity = {100, 11, 2};
+  auto second = profile_assignment(profile, worker, instances, assigned);
+  require(second && second->target_cpus == std::vector<int>({0}), "count distribution assignment");
+  worker.identity = {100, 12, 3};
+  auto third = profile_assignment(profile, worker, instances, assigned);
+  require(third && third->target_cpus == std::vector<int>({1}), "next affinity assignment");
+  worker.identity = {100, 13, 4};
+  require(!profile_assignment(profile, worker, instances, assigned), "profile overflow is unmanaged");
+  bool rejected = false;
+  try { load_thread_profile("tests/fixtures/thread-profile-small.json", {0}); }
+  catch (...) { rejected = true; }
+  require(rejected, "profile outside envelope rejected");
+  profile.status = "candidate";
+  profile.generated_at = "2026-08-12T00:00:00Z";
+  write_thread_profile(profile, "/tmp/affinitygraph-thread-profile-test.json");
+  auto roundtrip = load_thread_profile("/tmp/affinitygraph-thread-profile-test.json", {0, 1, 2, 3});
+  require(roundtrip.placements.size() == 1 && roundtrip.placements[0].affinities.size() == 2,
+          "thread profile export roundtrip");
+  auto empty = load_thread_profile("config/thread-profiles/runtime-only-empty.json", {0, 1, 2, 3});
+  require(empty.placements.empty() && !empty.dynamic.enabled,
+          "runtime-only empty profile loads without placement rules");
 }
 
 void test_identity_reuse_and_demand() {
@@ -1216,6 +1238,7 @@ int main() {
   static_assert(AFFINITYGRAPH_VFS_AGGREGATE_MAX_ENTRIES == 262144);
   try {
     test_cpu_lists();
+    test_thread_profile();
     test_identity_reuse_and_demand();
     test_relationship_score();
     test_relation_resident_set();
