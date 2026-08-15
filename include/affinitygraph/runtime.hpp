@@ -1,6 +1,7 @@
 #pragma once
 
 #include "affinitygraph/core.hpp"
+#include "affinitygraph/thread_profile.hpp"
 #include "affinitygraph/bpf_events.h"
 
 #include <atomic>
@@ -129,6 +130,9 @@ private:
   Actuator actuator_;
   IncrementalSolver solver_;
   NumaDomainSolver domain_solver_;
+  std::optional<ThreadProfile> thread_profile_;
+  std::map<std::string, size_t> profile_next_instances_;
+  std::map<ThreadIdentity, ProfileAssignment> profile_assignments_;
   mutable std::mutex mutex_;
   std::mutex bpf_pending_mutex_;
   std::deque<affinitygraph_bpf_event> pending_lifecycle_events_;
