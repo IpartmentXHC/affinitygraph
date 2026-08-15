@@ -73,6 +73,16 @@ void test_cpu_lists() {
               production.inactive_demand_threshold == 0.0 &&
               production.hotspot_replan_growth_ratio == 0.25,
           "NUMA domain configuration parsed");
+
+  auto cli_override = load_config("tests/runtime.toml", "3-4");
+  require(format_cpu_list(cli_override.cpus) == "3-4",
+          "command-line CPU override parsed");
+
+  setenv("AFFINITY_CPUS", "5-6", 1);
+  auto env_override = load_config("tests/runtime.toml");
+  unsetenv("AFFINITY_CPUS");
+  require(format_cpu_list(env_override.cpus) == "5-6",
+          "environment CPU override parsed");
 }
 
 void test_identity_reuse_and_demand() {

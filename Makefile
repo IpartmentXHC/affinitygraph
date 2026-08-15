@@ -6,12 +6,16 @@ CPPFLAGS += -Iinclude
 LDFLAGS ?=
 BUILD := build
 VMLINUX_H ?= $(BUILD)/bpf/vmlinux.h
+LATENCY_REPO ?= ../core-to-core-latency
+CALIBRATION_DIR ?= /etc/affinitygraph/calibration
+CALIBRATION_OUTPUT ?= $(CALIBRATION_DIR)/hardware-node-edges.csv
+CALIBRATION_SCRIPT := scripts/generate_calibration.sh
 
 CORE_SOURCES := src/config.cpp src/topology.cpp src/collector.cpp src/graph.cpp src/solver.cpp src/domain_solver.cpp src/actuator.cpp
 CORE_OBJECTS := $(CORE_SOURCES:%.cpp=$(BUILD)/%.o)
 RUNTIME_OBJECTS := $(BUILD)/src/runtime.o $(BUILD)/src/bpf_reader.o
 
-.PHONY: all test runtime-test clean install bpf \
+.PHONY: all test runtime-test clean install bpf calibrate \
 	ops-env-check ops-local-test ops-cloud-build ops-cloud-preflight \
 	ops-archive-dry ops-archive-apply ops-cloud-clean-dry ops-cloud-clean-apply
 
@@ -50,6 +54,11 @@ $(BUILD)/bpf/vmlinux.h:
 	@mkdir -p $(@D)
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
 
+calibrate:
+	@test -d "$(LATENCY_REPO)" || { echo "missing LATENCY_REPO=$(LATENCY_REPO)" >&2; exit 2; }
+	@test -x "$(CALIBRATION_SCRIPT)" || { echo "missing executable $(CALIBRATION_SCRIPT)" >&2; exit 2; }
+	sudo "$(CALIBRATION_SCRIPT)" --latency-repo "$(LATENCY_REPO)" --output "$(CALIBRATION_OUTPUT)"
+
 test: all
 	$(BUILD)/affinitygraph-tests
 	! nm -D $(BUILD)/affinity-replay | grep -E 'sched_setaffinity|bpf|socket|connect'
@@ -84,6 +93,8 @@ install: all
 	install -D -m 0644 calibration/kunpeng920/README.md $(DESTDIR)/etc/affinitygraph/calibration/README.md
 	install -D -m 0644 calibration/kunpeng920/checksums.sha256 $(DESTDIR)/etc/affinitygraph/calibration/checksums.sha256
 	install -D -m 0644 deploy/affinitygraph-clickhouse.service $(DESTDIR)/usr/lib/systemd/system/affinitygraph-clickhouse.service
+	install -D -m 0644 deploy/affinitygraph@.service $(DESTDIR)/usr/lib/systemd/system/affinitygraph@.service
+	install -D -m 0755 deploy/target-wrapper $(DESTDIR)/usr/libexec/affinitygraph/target-wrapper
 	install -D -m 0644 LICENSE $(DESTDIR)/usr/share/doc/affinitygraph/LICENSE
 	install -D -m 0644 THIRD_PARTY_NOTICES.md $(DESTDIR)/usr/share/doc/affinitygraph/THIRD_PARTY_NOTICES.md
 	install -D -m 0644 docs/operations.md $(DESTDIR)/usr/share/doc/affinitygraph/operations.md

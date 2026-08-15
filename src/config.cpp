@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
+#include <sched.h>
 #include <sstream>
 #include <stdexcept>
 
@@ -25,6 +27,19 @@ bool boolean(const std::string &value) {
   if (value == "true") return true;
   if (value == "false") return false;
   throw std::runtime_error("expected TOML boolean: " + value);
+}
+
+std::vector<int> detect_allowed_cpus() {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  if (sched_getaffinity(0, sizeof(mask), &mask) != 0)
+    throw std::runtime_error("sched_getaffinity failed while detecting CPUs");
+
+  std::vector<int> cpus;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+    if (CPU_ISSET(cpu, &mask)) cpus.push_back(cpu);
+  if (cpus.empty()) throw std::runtime_error("process CPU affinity mask is empty");
+  return cpus;
 }
 } // namespace
 
@@ -63,10 +78,11 @@ std::string format_cpu_list(const std::vector<int> &input) {
   return out.str();
 }
 
-Config load_config(const std::string &path) {
+Config load_config(const std::string &path, const std::string &cpu_override) {
   std::ifstream input(path);
   if (!input) throw std::runtime_error("cannot open config: " + path);
   Config c;
+  bool cpus_from_toml = false;
   std::string section, line;
   size_t line_number = 0;
   while (std::getline(input, line)) {
@@ -91,7 +107,10 @@ Config load_config(const std::string &path) {
       else if (mode == "plan") c.mode = Mode::Plan;
       else if (mode == "active") c.mode = Mode::Active;
       else throw std::runtime_error("mode must be observe, plan, or active");
-    } else if (key == "resources.cpus") c.cpus = parse_cpu_list(unquote(value));
+    } else if (key == "resources.cpus") {
+      c.cpus = parse_cpu_list(unquote(value));
+      cpus_from_toml = true;
+    }
     else if (key == "resources.calibration_path") c.calibration_path = unquote(value);
     else if (key == "runtime.log_directory") c.log_directory = unquote(value);
     else if (key == "runtime.socket_path") c.socket_path = unquote(value);
@@ -161,7 +180,16 @@ Config load_config(const std::string &path) {
     else if (key == "calibration.share_log_p95") c.share_log_p95 = std::stod(value);
     else throw std::runtime_error("unknown TOML key '" + key + "' at line " + std::to_string(line_number));
   }
-  if (c.cpus.empty()) throw std::runtime_error("resources.cpus is required");
+  // Explicit CLI value wins over the environment, TOML, and kernel discovery.
+  if (!cpu_override.empty()) {
+    c.cpus = parse_cpu_list(cpu_override);
+  } else if (const char *env = std::getenv("AFFINITY_CPUS");
+             env != nullptr && *env != '\0') {
+    c.cpus = parse_cpu_list(env);
+  } else if (!cpus_from_toml) {
+    c.cpus = detect_allowed_cpus();
+  }
+  if (c.cpus.empty()) throw std::runtime_error("CPU envelope is empty");
   if (c.sample_interval_seconds < 1 || c.graph_horizon_seconds < c.sample_interval_seconds ||
       c.solve_interval_seconds < c.sample_interval_seconds || c.minimum_confidence < 0 ||
       c.minimum_confidence > 1 || c.proposal_confirmations < 1 ||

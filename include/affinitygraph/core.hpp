@@ -85,7 +85,8 @@ struct Config {
   double share_log_p95 = 0.00894730347830295;
 };
 
-Config load_config(const std::string &path);
+Config load_config(const std::string &path,
+                   const std::string &cpu_override = {});
 std::vector<int> parse_cpu_list(const std::string &text);
 std::string format_cpu_list(const std::vector<int> &cpus);
 

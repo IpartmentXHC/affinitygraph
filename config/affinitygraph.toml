@@ -59,7 +59,8 @@ log_directory = "/var/log/affinitygraph"
 socket_path = "/run/affinitygraph/control.sock"
 
 [resources]
-cpus = "0-127"
+# Optional. CLI --cpus and AFFINITY_CPUS take precedence. If omitted, the
+# process/cgroup affinity mask is discovered at startup.
 calibration_path = "/etc/affinitygraph/calibration"
 
 [collector]

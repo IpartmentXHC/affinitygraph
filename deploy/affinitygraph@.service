@@ -1,0 +1,35 @@
+[Unit]
+Description=AffinityGraph supervised target %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+EnvironmentFile=-/etc/affinitygraph/targets/%i.env
+Environment=TARGET_CONFIG=/etc/affinitygraph/targets/%i.toml
+Environment=TARGET_SOCKET=/run/affinitygraph-%i/control.sock
+Environment=TARGET_LOG_DIRECTORY=/var/log/affinitygraph-%i
+
+RuntimeDirectory=affinitygraph-%i
+RuntimeDirectoryMode=0750
+LogsDirectory=affinitygraph-%i
+LogsDirectoryMode=0750
+
+ExecStartPre=/usr/bin/test -s /etc/affinitygraph/calibration/hardware-node-edges.csv
+ExecStartPre=/usr/sbin/affinity-run preflight --config ${TARGET_CONFIG} --bpf-object /usr/lib/affinitygraph/affinitygraph.bpf.o
+ExecStart=/usr/libexec/affinitygraph/target-wrapper %i
+ExecStop=/usr/bin/affinityctl pause --socket ${TARGET_SOCKET}
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120s
+TimeoutStopSec=120s
+LimitMEMLOCK=infinity
+NoNewPrivileges=true
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

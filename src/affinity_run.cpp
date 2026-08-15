@@ -33,6 +33,7 @@ struct Arguments {
   std::string config;
   std::string bpf_object;
   std::string user;
+  std::string cpus;
   std::vector<char *> command;
 };
 
@@ -47,11 +48,13 @@ Arguments parse(int argc, char **argv) {
       for (++i; i < argc; ++i) args.command.push_back(argv[i]);
       break;
     }
-    if ((arg == "--config" || arg == "--bpf-object" || arg == "--user") && i + 1 < argc) {
+    if ((arg == "--config" || arg == "--bpf-object" ||
+         arg == "--user" || arg == "--cpus") && i + 1 < argc) {
       std::string value = argv[++i];
       if (arg == "--config") args.config = value;
       else if (arg == "--bpf-object") args.bpf_object = value;
-      else args.user = value;
+      else if (arg == "--user") args.user = value;
+      else args.cpus = value;
     } else throw std::runtime_error("unknown or incomplete option: " + arg);
   }
   if (args.config.empty()) throw std::runtime_error("--config is required");
@@ -343,7 +346,7 @@ void install_signal_handlers() {
 }
 
 int preflight(const Arguments &args) {
-  Config config = load_config(args.config);
+  Config config = load_config(args.config, args.cpus);
   auto available = current_envelope();
   bool ok = true;
   std::cout << "config: ok\n";
@@ -497,7 +500,7 @@ int main(int argc, char **argv) {
     Arguments args = parse(argc, argv);
     if (args.action == "preflight") return preflight(args);
     if (args.action != "run") throw std::runtime_error("action must be preflight or run");
-    return supervise(args, load_config(args.config));
+    return supervise(args, load_config(args.config, args.cpus));
   } catch (const std::exception &error) {
     std::cerr << "affinity-run: " << error.what() << '\n';
     return 2;

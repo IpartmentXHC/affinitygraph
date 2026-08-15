@@ -53,7 +53,9 @@ void HardwareGraph::load_calibration(const std::string &path) {
   std::ifstream input(file);
   if (!input) throw std::runtime_error("cannot open hardware calibration: " + file.string());
   std::string header;
-  if (!std::getline(input, header) || header != "source_node,destination_node,same_socket,numa_distance,core_handoff_mean_ns,core_handoff_p95_ns,memory_load_mean_ns,memory_load_cv,stream_2t_triad_mbps,stream_32t_triad_mbps")
+  if (!std::getline(input, header) ||
+      (header != "source_node,destination_node,same_socket,numa_distance,core_handoff_mean_ns,core_handoff_p95_ns,memory_load_mean_ns,memory_load_cv,stream_2t_triad_mbps,stream_32t_triad_mbps" &&
+       header != "source_node,destination_node,same_socket,numa_distance,core_handoff_mean_ns,core_handoff_p95_ns,memory_load_mean_ns,memory_load_cv,stream_2t_triad_mbps,stream_32t_triad_mbps,is_estimated"))
     throw std::runtime_error("unsupported hardware calibration schema: " + file.string());
   std::string line;
   size_t loaded = 0;
@@ -62,7 +64,8 @@ void HardwareGraph::load_calibration(const std::string &path) {
     std::vector<std::string> cells;
     std::string cell;
     while (std::getline(row, cell, ',')) cells.push_back(cell);
-    if (cells.size() != 10) throw std::runtime_error("invalid hardware calibration row");
+    if (cells.size() != 10 && cells.size() != 11)
+      throw std::runtime_error("invalid hardware calibration row");
     int from = std::stoi(cells[0]), to = std::stoi(cells[1]);
     double distance = std::stod(cells[3]), handoff = std::stod(cells[4]);
     node_distance[{from, to}] = distance;

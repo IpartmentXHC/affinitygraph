@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target_name=${1:?target instance name is required}
+: "${TARGET_CONFIG:?TARGET_CONFIG is required}"
+: "${TARGET_EXECUTABLE:?TARGET_EXECUTABLE is required for ${target_name}}"
+: "${TARGET_USER:?TARGET_USER is required for ${target_name}}"
+
+command=("$TARGET_EXECUTABLE")
+for index in $(seq 1 64); do
+  variable="TARGET_ARG_${index}"
+  [[ -v "$variable" ]] || break
+  command+=("${!variable}")
+done
+
+exec /usr/sbin/affinity-run run \
+  --config "$TARGET_CONFIG" \
+  --bpf-object /usr/lib/affinitygraph/affinitygraph.bpf.o \
+  --user "$TARGET_USER" \
+  -- "${command[@]}"
