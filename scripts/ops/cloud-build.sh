@@ -48,7 +48,14 @@ source_hash=$(sha256sum "$archive" | awk '{print substr($1,1,16)}')
 release="$release_root/$source_hash"
 
 if ssh "$host" test -e "$release"; then
-  die "immutable release already exists: $host:$release"
+  if ssh "$host" test -x "$release/build/affinity-run" && \
+     ssh "$host" test -f "$release/build/affinitygraph.bpf.o"; then
+    mkdir -p "$(dirname "$state_file")"
+    printf 'AFFINITYGRAPH_LAST_RELEASE=%q\n' "$release" >"$state_file"
+    echo "[PASS] immutable cloud release already built and tested: $release"
+    exit 0
+  fi
+  die "immutable release exists but is incomplete: $host:$release"
 fi
 ssh "$host" mkdir -p "$release_root"
 ssh "$host" mkdir "$release"

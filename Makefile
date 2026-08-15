@@ -7,7 +7,7 @@ LDFLAGS ?=
 BUILD := build
 VMLINUX_H ?= $(BUILD)/bpf/vmlinux.h
 
-CORE_SOURCES := src/config.cpp src/topology.cpp src/collector.cpp src/graph.cpp src/solver.cpp src/domain_solver.cpp src/actuator.cpp
+CORE_SOURCES := src/config.cpp src/topology.cpp src/collector.cpp src/graph.cpp src/solver.cpp src/domain_solver.cpp src/thread_profile.cpp src/actuator.cpp
 CORE_OBJECTS := $(CORE_SOURCES:%.cpp=$(BUILD)/%.o)
 RUNTIME_OBJECTS := $(BUILD)/src/runtime.o $(BUILD)/src/bpf_reader.o
 
@@ -100,7 +100,7 @@ ops-cloud-build:
 
 ops-cloud-preflight:
 	@test -n "$(CONFIG)" || { echo "CONFIG=<config.toml> is required" >&2; exit 2; }
-	./scripts/ops/cloud-preflight.sh --config "$(CONFIG)" $(if $(RELEASE),--release "$(RELEASE)",)
+	./scripts/ops/cloud-preflight.sh --config "$(CONFIG)" $(if $(PROFILE),--thread-profile "$(PROFILE)",) $(if $(RELEASE),--release "$(RELEASE)",)
 
 ops-archive-dry:
 	./scripts/ops/experiment-archive.sh --dry-run

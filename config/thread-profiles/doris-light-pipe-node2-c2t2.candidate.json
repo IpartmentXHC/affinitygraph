@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "profile_id": "doris-light-pipe-node2-c4t4",
+  "generated_at": "2026-08-12T05:46:51Z",
+  "status": "candidate",
+  "source": {"commit": "feature/per-thread-profile-v1", "experiment_id": "20260812-doris-thread-profile-v1-c2t2-retest", "test_id": "profile-v1-10-profile-C2T2-r5"},
+  "applicability": {"description": "Doris C4T4: only brpc_light (512) and Pipe_normal (128) receive node2 CPUs 64-95; brpc_heavy and all other threads remain unmanaged.", "similarity": {"metric": "", "threshold": null, "reported_gap": null}},
+  "dynamic": {"enabled": false, "small_step_threads": 1, "large_change_ratio": 0.3, "large_step_threads": 4, "cooldown_seconds": 10},
+  "placements": [
+    {"id": "doris-brpc-light-node2", "match": {"comm": "brpc_light", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-95", "dynamic": false, "affinities": [{"cpus": "64-95", "count": 512}]},
+    {"id": "doris-pipe-normal-node2", "match": {"comm": null, "comm_prefix": "Pipe_normal", "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-95", "dynamic": false, "affinities": [{"cpus": "64-95", "count": 128}]}
+  ]
+}

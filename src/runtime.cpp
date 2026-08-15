@@ -22,6 +22,15 @@
 
 namespace affinitygraph {
 namespace {
+std::string utc_timestamp() {
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
+  std::tm value{};
+  gmtime_r(&seconds, &value);
+  char buffer[32]{};
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &value);
+  return buffer;
+}
 std::string json_escape(const std::string &value) {
   std::ostringstream out;
   for (unsigned char c : value) {
@@ -276,6 +285,16 @@ Runtime::Runtime(Config config, int root_pid, std::shared_ptr<BpfRingReader> bpf
   std::filesystem::create_directories(config_.log_directory);
   std::string path = config_.log_directory + "/runtime.jsonl";
   log_fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+  if (!config_.thread_profile_path.empty()) {
+    try {
+      thread_profile_ = load_thread_profile(config_.thread_profile_path, config_.cpus);
+      log("profile_load", "\"path\":\"" + json_escape(config_.thread_profile_path) +
+          "\",\"status\":\"" + thread_profile_->status + "\",\"success\":true");
+    } catch (const std::exception &error) {
+      log("profile_load", "\"path\":\"" + json_escape(config_.thread_profile_path) +
+          "\",\"success\":false,\"error\":\"" + json_escape(error.what()) + "\"");
+    }
+  }
   open_control_socket();
   if (bpf_reader_) bpf_worker_ = std::thread([this] { run_bpf(); });
   worker_ = std::thread([this] { run(); });
@@ -332,6 +351,22 @@ Runtime::~Runtime() {
         ",\"dropped_by_kind\":" + bpf_kind_counts_json(health.dropped_by_kind) +
         ",\"suppressed_by_kind\":" + bpf_kind_counts_json(health.suppressed_by_kind) +
         ",\"final\":true");
+  }
+  if (thread_profile_) {
+    try {
+      ThreadProfile exported = *thread_profile_;
+      exported.status = "candidate";
+      exported.generated_at = utc_timestamp();
+      exported.experiment_id = config_.experiment_id;
+      exported.test_id = config_.test_id;
+      std::string output = config_.profile_output_path.empty()
+          ? config_.log_directory + "/profiles/thread-profile-candidate.json"
+          : config_.profile_output_path;
+      write_thread_profile(exported, output);
+      log("profile_export", "\"path\":\"" + json_escape(output) + "\",\"status\":\"candidate\"");
+    } catch (const std::exception &error) {
+      log("profile_export", "\"success\":false,\"error\":\"" + json_escape(error.what()) + "\"");
+    }
   }
   auto restored = actuator_.restore_all();
   log("runtime_stop", "\"restore_requested\":" + std::to_string(restored.requested) +
@@ -434,6 +469,8 @@ void Runtime::application_affinity(int tid, const std::vector<int> &cpus) {
 
 void Runtime::handle_bpf_event(const affinitygraph_bpf_event &event) {
   if (event.kind == AFFINITYGRAPH_FUTEX || event.kind == AFFINITYGRAPH_VFS) {
+    if (thread_profile_ && !thread_profile_->dynamic.enabled &&
+        !thread_profile_->placements.empty()) return;
     std::lock_guard lock(mutex_);
     auto from = lifecycle_.find(static_cast<int>(event.tid));
     auto peer = lifecycle_.find(static_cast<int>(event.peer_tid));
@@ -793,6 +830,8 @@ void Runtime::service_control_socket() {
 
 void Runtime::reconcile_and_sample() {
   try {
+    const bool static_profile = thread_profile_ && !thread_profile_->dynamic.enabled &&
+                                !thread_profile_->placements.empty();
     std::set<int> targets;
     {
       std::lock_guard lock(mutex_);
@@ -805,20 +844,24 @@ void Runtime::reconcile_and_sample() {
       existing_targets.insert(tgid);
       auto process_samples = collector_.sample(tgid);
       samples.insert(samples.end(), process_samples.begin(), process_samples.end());
-      auto pages = collector_.numa_pages(tgid);
-      std::ostringstream fields;
-      fields << "\"scope\":\"process\",\"tgid\":" << tgid << ",\"pages\":{";
-      bool first = true;
-      for (const auto &[node, count] : pages) {
-        if (!first) fields << ',';
-        first = false;
-        fields << '"' << node << "\":" << count;
+      if (!static_profile) {
+        auto pages = collector_.numa_pages(tgid);
+        std::ostringstream fields;
+        fields << "\"scope\":\"process\",\"tgid\":" << tgid << ",\"pages\":{";
+        bool first = true;
+        for (const auto &[node, count] : pages) {
+          if (!first) fields << ',';
+          first = false;
+          fields << '"' << node << "\":" << count;
+        }
+        fields << '}';
+        log("numa_maps", fields.str());
       }
-      fields << '}';
-      log("numa_maps", fields.str());
     }
     if (samples.empty()) throw std::runtime_error("no target task samples");
     std::set<int> seen;
+    PlacementDelta profile_delta;
+    std::set<int> profile_live;
     {
       std::lock_guard lock(mutex_);
       target_tgids_ = std::move(existing_targets);
@@ -855,16 +898,54 @@ void Runtime::reconcile_and_sample() {
         sample.parent_tid = life->second.parent_tid;
         sample.start_routine = life->second.start_routine;
         sample.start_symbol = life->second.start_symbol;
+        if (thread_profile_) {
+          const bool newly_matched = !profile_assignments_.contains(sample.identity);
+          auto assignment = profile_assignment(*thread_profile_, sample,
+                                               profile_next_instances_, profile_assignments_);
+          if (assignment && newly_matched) {
+            std::vector<int> target;
+            std::set_intersection(assignment->target_cpus.begin(), assignment->target_cpus.end(),
+                                  sample.allowed_cpus.begin(), sample.allowed_cpus.end(),
+                                  std::back_inserter(target));
+            if (target.empty()) {
+              log("profile_match", "\"tid\":" + std::to_string(sample.identity.tid) +
+                  ",\"rule_id\":\"" + json_escape(assignment->rule_id) +
+                  "\",\"outcome\":\"empty_allowed_intersection\"");
+            } else {
+              profile_delta.tid_to_mask[sample.identity.tid] = target;
+              profile_live.insert(sample.identity.tid);
+              log("profile_match", "\"tid\":" + std::to_string(sample.identity.tid) +
+                  ",\"starttime\":" + std::to_string(sample.identity.starttime) +
+                  ",\"rule_id\":\"" + json_escape(assignment->rule_id) +
+                  "\",\"instance\":" + std::to_string(assignment->instance) +
+                  ",\"target_cpus\":\"" + format_cpu_list(target) + "\"");
+            }
+          }
+        }
       }
       for (auto it = lifecycle_.begin(); it != lifecycle_.end();) {
         if (!seen.contains(it->first)) {
-          current_plan_.erase(it->first);
-          current_masks_.erase(it->first);
-          domain_solver_.remove_thread(it->first);
+          if (!static_profile) {
+            current_plan_.erase(it->first);
+            current_masks_.erase(it->first);
+            domain_solver_.remove_thread(it->first);
+          }
           it = lifecycle_.erase(it);
         } else ++it;
       }
-      graph_.observe_threads(samples);
+      if (!static_profile) graph_.observe_threads(samples);
+    }
+    if (!profile_delta.tid_to_mask.empty()) {
+      if (config_.mode == Mode::Active) {
+        auto result = actuator_.apply(profile_delta, profile_live);
+        log("initial_affinity", "\"requested\":" + std::to_string(result.requested) +
+            ",\"committed\":" + std::to_string(result.committed) +
+            ",\"success\":" + (result.success ? "true" : "false") +
+            ",\"rollback_success\":" + (result.rollback_success ? "true" : "false"));
+      } else {
+        log("initial_affinity", "\"requested\":" + std::to_string(profile_delta.tid_to_mask.size()) +
+            ",\"outcome\":\"" + (config_.mode == Mode::Plan ? "shadow" : "observed") + "\"");
+      }
     }
     collector_failed_since_ns_ = 0;
   } catch (const std::exception &error) {
@@ -1282,6 +1363,15 @@ void Runtime::maybe_solve(uint64_t now) {
   if (config_.mode == Mode::Observe) {
     log("solve_window_end", "\"window_id\":\"" + window_id +
         "\",\"complete\":true,\"outcome\":\"observed\"");
+    return;
+  }
+  // A static profile is an explicit placement experiment.  Its disabled
+  // dynamic section prevents the legacy solver from changing the verified
+  // initial masks during the measurement window.
+  if (thread_profile_ && !thread_profile_->dynamic.enabled &&
+      !thread_profile_->placements.empty()) {
+    log("solve_window_end", "\"window_id\":\"" + window_id +
+        "\",\"complete\":true,\"outcome\":\"profile_static_hold\"");
     return;
   }
   if (config_.solver == "numa-domain-v1") {

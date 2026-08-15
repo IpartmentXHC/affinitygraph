@@ -22,6 +22,10 @@ struct Config {
   std::string calibration_path;
   std::string log_directory = "/tmp/affinitygraph";
   std::string socket_path = "/tmp/affinitygraph.sock";
+  std::string thread_profile_path;
+  std::string profile_output_path;
+  std::string experiment_id;
+  std::string test_id;
   int sample_interval_seconds = 1;
   int graph_horizon_seconds = 60;
   int solve_interval_seconds = 10;
@@ -140,6 +144,7 @@ struct ThreadSample {
   int recent_cpu = -1;
   char state = '?';
   std::string comm;
+  std::vector<std::string> cgroups;
   std::vector<int> allowed_cpus;
   int parent_tid = -1;
   uintptr_t start_routine = 0;
