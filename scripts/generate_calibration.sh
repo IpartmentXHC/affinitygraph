@@ -73,7 +73,10 @@ cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
 echo "[INFO] building core-to-core-latency offline"
-cargo build --release --offline --manifest-path "$LATENCY_REPO/Cargo.toml"
+# Run cargo from inside the latency repo so its .cargo/config.toml source
+# replacement (vendored crates) is discovered; cargo resolves configuration
+# relative to the working directory, not --manifest-path.
+(cd "$LATENCY_REPO" && cargo build --release --offline)
 BENCH="$LATENCY_REPO/target/release/core-to-core-latency"
 [[ -x "$BENCH" ]] || die "benchmark binary was not produced: $BENCH"
 
