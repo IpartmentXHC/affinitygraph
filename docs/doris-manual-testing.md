@@ -108,20 +108,84 @@ sudo -A ./build/affinityctl dump  --socket /tmp/affinitygraph-doris.sock
 
 适用：已有实验验证的放置方案（参考
 `config/thread-profiles/doris-light-pipe-node2-*.candidate.json`，Doris
-`brpc_light`/`Pipe_normal` → node2 CPU 集合），做复现/确认实验。
+`brpc_light`/`Pipe_normal` → node2 CPU 集合），做复现/确认实验。以下命令
+按顺序逐条执行（默认在 affinitygraph 仓库根目录、sudo 用 `-A`）。
 
-### 2.1 准备 profile
+### 2.1 前置确认
 
-复制样例并改到你的机器上（**CPU 集合必须是本机信封内、且与实测拓扑一致**）：
+```sh
+# 1) 构建产物与 BPF 对象就绪
+ls -l build/affinity-run build/affinitygraph.bpf.o
 
-```json
+# 2) 基础 preflight 通过（bpf: ok）
+sudo -A ./build/affinity-run preflight \
+  --config config/affinitygraph.toml \
+  --bpf-object build/affinitygraph.bpf.o
+```
+
+### 2.2 确认拓扑，确定目标 CPU 集合
+
+```sh
+# 查看 CPU→NUMA node 映射，选定目标 node 的 CPU 列表（示例 node2 → 64-95）
+lscpu -e=CPU,NODE,SOCKET | sort -k2 -n | less
+# 或用 numactl（未安装则跳过）
+numactl --hardware
+```
+
+### 2.3 停掉旧 Doris，准备目录
+
+```sh
+# affinity-run 必须自己拉起进程树，所以先停掉已在运行的 Doris
+/opt/doris/fe/bin/stop_fe.sh || true
+/opt/doris/be/bin/stop_be.sh || true
+
+sudo -A mkdir -p /etc/affinitygraph/targets /etc/affinitygraph/profiles
+sudo -A mkdir -p /var/log/affinitygraph-doris/profiles
+```
+
+### 2.4 写测试配置
+
+```sh
+sudo -A tee /etc/affinitygraph/targets/doris.toml >/dev/null <<'EOF'
+[runtime]
+mode = "active"                    # 静态放置只有在 active 才会真正落盘
+sample_interval_seconds = 1
+graph_horizon_seconds = 60
+solve_interval_seconds = 10
+minimum_confidence = 0.8
+proposal_confirmations = 3
+solver = "incremental-hotspot-v1"  # 静态保持会跳过 solver，值不影响
+affinity_granularity = "singleton_cpu"
+maximum_managed_threads = 128
+log_directory = "/var/log/affinitygraph-doris"
+socket_path = "/tmp/affinitygraph-doris.sock"
+
+[resources]
+calibration_path = "/etc/affinitygraph/calibration"
+
+[collector]
+required = true
+pthread_uprobe = true
+
+[calibration]
+id = "doris-manual-test"
+activity_log_p95 = 1.0
+sync_log_p95 = 1.0
+share_log_p95 = 1.0
+EOF
+```
+
+### 2.5 写放置文件 profile
+
+```sh
+sudo -A tee /etc/affinitygraph/profiles/doris-static.json >/dev/null <<'EOF'
 {
   "schema_version": 1,
-  "profile_id": "doris-light-pipe-node2",
+  "profile_id": "doris-manual-a-r1",
   "generated_at": "2026-08-17T00:00:00Z",
   "status": "candidate",
   "source": {"commit": "main", "experiment_id": "doris-manual-a", "test_id": "r1"},
-  "applicability": {"description": "doris manual run"},
+  "applicability": {"description": "doris static placement r1"},
   "dynamic": {"enabled": false, "small_step_threads": 1,
               "large_change_ratio": 0.3, "large_step_threads": 4,
               "cooldown_seconds": 10},
@@ -136,35 +200,38 @@ sudo -A ./build/affinityctl dump  --socket /tmp/affinitygraph-doris.sock
      "affinities": [{"cpus": "64-95", "count": 128}]}
   ]
 }
+EOF
 ```
 
-- `match` 支持 `comm`/`comm_prefix`/`cgroup`/`cgroup_prefix`/`tid` 的任意组合；
-  一个规则至少一个匹配字段。
-- `affinities` 按 `count` 顺序分配实例（前 512 个 `brpc_light` → `64-95`，
-  下一个亲和组给第 513+ 个）。
-- `allowed_cpus` 与每个 `affinities[].cpus` 必须都在资源信封内，否则 preflight
-  直接拒绝。
-- `status` 只能是 `candidate` 或 `tested`。
+> `64-95` 只是示例，必须替换为 2.2 确认的本机 node CPU 列表。约束：
+> `allowed_cpus` 与每个 `affinities[].cpus` 都必须在资源信封内（preflight
+> 会拒绝越界）；`status` 只能是 `candidate`/`tested`；`profile_id`、
+> `generated_at` 必填。
 
-### 2.2 preflight 校验 profile
+### 2.6 preflight 校验 profile
 
 ```sh
 sudo -A ./build/affinity-run preflight \
   --config /etc/affinitygraph/targets/doris.toml \
-  --thread-profile /etc/affinitygraph/profiles/doris-light-pipe.json \
+  --thread-profile /etc/affinitygraph/profiles/doris-static.json \
   --bpf-object build/affinitygraph.bpf.o
-# 期望 thread_profile: ok (2 placement rule(s), static)
+
+# 期望输出：
+#   config: ok
+#   thread_profile: ok (2 placement rule(s), static)
+#   cpu_envelope: ok (0-127)
+#   kernel: ...
+#   bpf: ok
+#   pthread_uprobe: auto
 ```
 
-### 2.3 启动（active 模式才会真正落盘放置）
-
-把配置里的 `mode` 改为 `active`，然后：
+### 2.7 启动（终端 1：保持前台运行）
 
 ```sh
 sudo -A ./build/affinity-run run \
   --config /etc/affinitygraph/targets/doris.toml \
-  --thread-profile /etc/affinitygraph/profiles/doris-light-pipe.json \
-  --profile-output /var/log/affinitygraph-doris/profiles/candidate-r1.json \
+  --thread-profile /etc/affinitygraph/profiles/doris-static.json \
+  --profile-output /var/log/affinitygraph-doris/profiles/doris-r1.candidate.json \
   --experiment-id doris-manual-a --test-id r1 \
   --bpf-object build/affinitygraph.bpf.o \
   --user doris \
@@ -173,35 +240,76 @@ sudo -A ./build/affinity-run run \
                && wait'
 ```
 
-> `dynamic.enabled=false` 时 runtime 只做“初始放置 + 静态保持”，跳过
-> 图构建和 solver；`observe` 模式只记录不落盘，`plan` 只做 shadow。
+`dynamic.enabled=false` 时 runtime 只做“初始放置 + 静态保持”，跳过图构建和
+solver；wrapper 不退出，supervisor 就一直监督。
 
-### 2.4 验证放置生效
+### 2.8 验证放置生效（终端 2）
 
 ```sh
-# runtime 日志：profile_load → profile_match（每个命中 tid）→ initial_affinity
-grep -E '"type":"(profile_load|profile_match|initial_affinity)"' \
-  /var/log/affinitygraph-doris/runtime.jsonl | tail -20
+# 等待 Doris FE/BE 起来并完成采样
+sleep 20
 
-# status 里 active_effective 应为 true，且 collector_degraded=false
+# 1) runtime 日志三连：profile_load → profile_match → initial_affinity
+sudo -A grep -E '"type":"(profile_load|profile_match|initial_affinity)"' \
+  /var/log/affinitygraph-doris/runtime.jsonl | tail -30
+
+# 期望：
+#   profile_load  ... "success":true
+#   profile_match ... "rule_id":"brpc-light" "target_cpus":"64-95"（每个命中线程一条）
+#   initial_affinity ... "requested":N,"committed":N,"success":true
+
+# 2) supervisor 健康（bpf 生效、未降级、未暂停）
 sudo -A ./build/affinityctl status --socket /tmp/affinitygraph-doris.sock
-sudo -A ./build/affinityctl dump  --socket /tmp/affinitygraph-doris.sock
-# dump 中查看目标 tid 的当前 mask 是否等于 profile 的 cpus（如 64-95）
+# 关注 "bpf":true、"collector_degraded":false、"paused":false、"target_tgids" 覆盖 FE+BE
+
+# 3) 抽查内核实际掩码（从 profile_match 里挑几个 tid）
+TID=12345   # 替换为 profile_match 输出的某个 tid
+sudo -A sh -c "grep Cpus_allowed_list /proc/$TID/status"
+# 期望 Cpus_allowed_list: 64-95
 ```
 
-确认 `active_effective=true` 后再开始 YCSB 正式测量。
+> **注意**：静态 profile 下 `active_effective` 恒为 `false`（静态保持提前返回、
+> `selector_ready` 不会置位，这是设计行为），不要用它作为测量门禁；以
+> `initial_affinity success:true` + 实际掩码为准。
 
-### 2.5 结束与导出
+### 2.9 YCSB 测量（终端 3）
 
 ```sh
-# 先 pause 同步恢复掩码，再停 supervisor
-sudo -A ./build/affinityctl pause --socket /tmp/affinitygraph-doris.sock
-# 日志应出现 restore 记录
-grep '"type":"restore' /var/log/affinitygraph-doris/runtime.jsonl | tail
-
-# 正常退出（SIGTERM wrapper）后 runtime 导出 candidate 到 --profile-output
-grep '"type":"profile_export"' /var/log/affinitygraph-doris/runtime.jsonl
+# 代表命令，按你的 YCSB 客户端/表结构调整；目标是 Doris FE 的 MySQL 端口
+./bin/ycsb run jdbc -P workloads/workloada \
+  -p jdbc.url="jdbc:mysql://127.0.0.1:9030/testdb" \
+  -p jdbc.user=root -p jdbc.password='' \
+  -p operationcount=1000000 -threads 32
 ```
+
+测量期间可随时在终端 2 查看 `status`/日志确认放置未漂移。
+
+### 2.10 结束实验并导出 candidate
+
+```sh
+# 1) 先 pause，同步恢复掩码
+sudo -A ./build/affinityctl pause --socket /tmp/affinitygraph-doris.sock
+# 输出中 "restore_requested":N,"restore_restored":N 应相等
+
+# 2) 回到终端 1 按 Ctrl+C（supervisor 收到信号后转发给 wrapper，收尾退出）
+#    或另开终端: sudo -A kill -TERM <affinity-run 的 pid>
+
+# 3) 核对收尾日志：runtime_stop 的 restore 计数 + profile_export
+sudo -A grep -E '"type":"(pause|runtime_stop|profile_export)"' \
+  /var/log/affinitygraph-doris/runtime.jsonl | tail
+
+# 4) 查看导出的 candidate（generated_at 已刷新为结束时间）
+sudo -A head -8 /var/log/affinitygraph-doris/profiles/doris-r1.candidate.json
+```
+
+### 2.11 场景 A 排障
+
+- `profile_load "success":false`：profile 路径/信封/status 非法，看 `error` 字段。
+- `profile_match "outcome":"empty_allowed_intersection"`：该线程的
+  `allowed_cpus` 与 profile `cpus` 交集为空，检查信封与 cgroup 掩码。
+- `initial_affinity "success":false`：看 `rollback_success` 与
+  `runtime_start` 的 `affinity_capability`（active 需要保留 CAP_SYS_NICE）。
+- `collector_degraded=true`：BPF 未生效，回到 2.1/2.6 检查。
 
 ## 3. 场景 B：无放置文件（动态 solver）
 
