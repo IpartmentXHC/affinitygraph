@@ -2,15 +2,16 @@
 
 ## Build and install
 
-The user-space build requires a C++20 compiler, GNU make, and `libbpf.so.1` at
-runtime. The required BPF build additionally requires clang with the BPF
-backend and a reviewed `vmlinux.h`. `make bpf` generates the header with
-bpftool when one has not already been staged under `build/bpf/`.
+The build requires a C++20 compiler, GNU make, clang with the BPF backend, a
+working `bpftool` (a real binary is auto-discovered under
+`/usr/lib/linux-tools-*/`; a packaged stub is rejected), and `libbpf.so.1` at
+runtime. `make all` builds the user-space binaries, tests, and the CO-RE
+object `build/affinitygraph.bpf.o` (generating `build/bpf/vmlinux.h` from
+kernel BTF when missing). `make bpf` builds only the CO-RE object.
 
 ```sh
 make -j CXX=/usr/bin/clang++-18
 make test
-make bpf CLANG=/usr/bin/clang-18
 sudo make install
 ```
 
@@ -154,7 +155,7 @@ then stop the process.
 - [ ] Kernel 6.12/ARM64 (or reviewed equivalent) with BTF:
       `/sys/kernel/btf/vmlinux` exists.
 - [ ] Toolchain: C++20 compiler, make, clang with BPF backend, bpftool, and
-      `libbpf.so.1` installed. `make bpf` produces `build/affinitygraph.bpf.o`.
+      `libbpf.so.1` installed. `make all` produces `build/affinitygraph.bpf.o`.
 - [ ] Platform calibration reviewed and placed at
       `/etc/affinitygraph/calibration/hardware-node-edges.csv` (10 or 11
       columns), checksums recorded; override via

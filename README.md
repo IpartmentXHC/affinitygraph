@@ -15,7 +15,8 @@ The default example is `observe`, intentionally. Read
 `docs/operations.md` and `docs/validation.md` before enabling `active`.
 
 Main artifacts are `build/affinity-run`, `build/affinityctl`, the CO-RE object
-from `make bpf`, the offline single-window/sequence `build/affinity-replay`,
+`build/affinitygraph.bpf.o` (from `make all` or `make bpf`), the offline
+single-window/sequence `build/affinity-replay`,
 the runtime-log NUMA-domain replay tool `build/affinity-domain-replay`,
 the systemd unit under
 `deploy/`, and JSONL lifecycle/metric/plan/action logs.

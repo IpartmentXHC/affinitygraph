@@ -6,6 +6,10 @@ CPPFLAGS += -Iinclude
 LDFLAGS ?=
 BUILD := build
 VMLINUX_H ?= $(BUILD)/bpf/vmlinux.h
+# Prefer a real bpftool binary. On Ubuntu the packaged /usr/sbin/bpftool is a
+# stub that only prints a warning when linux-tools for the running kernel is
+# missing, which would poison vmlinux.h.
+BPFTOOL ?= $(shell { for c in /usr/lib/linux-tools-*/bpftool; do [ -x "$$c" ] && { echo "$$c"; exit 0; }; done; command -v bpftool 2>/dev/null || true; })
 LATENCY_REPO ?= $(CURDIR)/dep/core-to-core-latency
 CALIBRATION_DIR ?= /etc/affinitygraph/calibration
 CALIBRATION_OUTPUT ?= $(CALIBRATION_DIR)/hardware-node-edges.csv
@@ -19,7 +23,7 @@ RUNTIME_OBJECTS := $(BUILD)/src/runtime.o $(BUILD)/src/bpf_reader.o
 	ops-env-check ops-local-test ops-cloud-build ops-cloud-preflight \
 	ops-archive-dry ops-archive-apply ops-cloud-clean-dry ops-cloud-clean-apply
 
-all: $(BUILD)/affinity-run $(BUILD)/affinityctl $(BUILD)/affinity-replay $(BUILD)/affinity-domain-replay $(BUILD)/affinitygraph-tests $(BUILD)/supervisor-test $(BUILD)/bpf-lifecycle-test
+all: $(BUILD)/affinity-run $(BUILD)/affinityctl $(BUILD)/affinity-replay $(BUILD)/affinity-domain-replay $(BUILD)/affinitygraph-tests $(BUILD)/supervisor-test $(BUILD)/bpf-lifecycle-test $(BUILD)/affinitygraph.bpf.o
 
 $(BUILD)/%.o: %.cpp include/affinitygraph/core.hpp
 	@mkdir -p $(@D)
@@ -46,13 +50,17 @@ $(BUILD)/supervisor-test: tests/supervisor_test.cpp
 $(BUILD)/bpf-lifecycle-test: tests/bpf_lifecycle_test.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -pthread -o $@
 
-bpf: $(VMLINUX_H)
+bpf: $(BUILD)/affinitygraph.bpf.o
+
+$(BUILD)/affinitygraph.bpf.o: $(VMLINUX_H) bpf/affinitygraph.bpf.c include/affinitygraph/bpf_events.h
 	@mkdir -p $(BUILD)
-	$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_arm64 -I$(dir $(VMLINUX_H)) -Iinclude -c bpf/affinitygraph.bpf.c -o $(BUILD)/affinitygraph.bpf.o
+	$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_arm64 -I$(dir $(VMLINUX_H)) -Iinclude -c bpf/affinitygraph.bpf.c -o $@
 
 $(BUILD)/bpf/vmlinux.h:
 	@mkdir -p $(@D)
-	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
+	@test -n "$(BPFTOOL)" || { echo "[FAIL] bpftool not found; install linux-tools-$(shell uname -r) or stage a real bpftool" >&2; exit 1; }
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@ || { rm -f $@; echo "[FAIL] $(BPFTOOL) could not dump kernel BTF" >&2; exit 1; }
+	@head -n1 $@ | grep -q '#ifndef __VMLINUX_H__' || { echo "[FAIL] $(BPFTOOL) produced an invalid vmlinux.h (stub or unsupported tool)" >&2; rm -f $@; exit 1; }
 
 calibrate:
 	@test -d "$(LATENCY_REPO)" || { echo "missing LATENCY_REPO=$(LATENCY_REPO)" >&2; exit 2; }
