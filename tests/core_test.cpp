@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <set>
@@ -105,6 +106,19 @@ void test_thread_profile() {
   unsetenv("AFFINITY_CPUS");
   require(format_cpu_list(env_override.cpus) == "5-6",
           "environment CPU override parsed");
+
+  auto profile_config = load_config("tests/fixtures/config-thread-profile.toml");
+  require(profile_config.thread_profile_path == "/opt/affinitygraph/profiles/db.json" &&
+              profile_config.profile_output_path == "/var/log/affinitygraph/profiles/db-candidate.json" &&
+              profile_config.experiment_id == "exp-42" &&
+              profile_config.test_id == "test-42",
+          "thread profile TOML configuration parsed");
+
+  setenv("AFFINITY_THREAD_PROFILE", "/env/profile.json", 1);
+  auto env_profile = load_config("tests/fixtures/config-thread-profile.toml");
+  unsetenv("AFFINITY_THREAD_PROFILE");
+  require(env_profile.thread_profile_path == "/env/profile.json",
+          "AFFINITY_THREAD_PROFILE overrides TOML path");
 }
 
 void test_identity_reuse_and_demand() {
@@ -200,6 +214,23 @@ void test_hardware_calibration() {
   require(h.node_calibration[{0, 1}].memory_load_mean_ns > 100 &&
               h.node_calibration[{0, 1}].stream_32t_triad_mbps > 30000,
           "raw memory and STREAM calibration retained");
+
+  const char *eleven = "/tmp/affinitygraph-calibration-11col.csv";
+  {
+    std::ofstream out(eleven);
+    out << "source_node,destination_node,same_socket,numa_distance,"
+           "core_handoff_mean_ns,core_handoff_p95_ns,memory_load_mean_ns,"
+           "memory_load_cv,stream_2t_triad_mbps,stream_32t_triad_mbps,is_estimated\n"
+        << "0,1,0,12,200.0,300.0,400.0,0.05,60000.0,120000.0,true\n"
+        << "1,0,0,12,200.0,300.0,400.0,0.05,60000.0,120000.0,false\n"
+        << "0,0,1,10,120.0,180.0,250.0,0.04,70000.0,140000.0,true\n"
+        << "1,1,1,10,120.0,180.0,250.0,0.04,70000.0,140000.0,true\n";
+  }
+  HardwareGraph eleven_graph;
+  eleven_graph.cpus = {{0, 0, true}, {1, 0, true}, {2, 1, true}, {3, 1, true}};
+  eleven_graph.load_calibration(eleven);
+  require(eleven_graph.node_calibration[{0, 1}].handoff_p95_ns == 300.0,
+          "11-column is_estimated calibration loads");
 }
 
 void test_active_cohort_confirmation_signature() {

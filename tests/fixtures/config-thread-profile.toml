@@ -1,0 +1,18 @@
+[runtime]
+thread_profile = "/opt/affinitygraph/profiles/db.json"
+profile_output = "/var/log/affinitygraph/profiles/db-candidate.json"
+experiment_id = "exp-42"
+test_id = "test-42"
+
+[resources]
+cpus = "0-3"
+calibration_path = ""
+
+[collector]
+required = false
+
+[calibration]
+id = "test"
+activity_log_p95 = 1.0
+sync_log_p95 = 1.0
+share_log_p95 = 1.0

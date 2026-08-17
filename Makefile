@@ -72,6 +72,8 @@ test: all
 	grep -q '"families":\["family-a","family-b"\]' $(BUILD)/domain-replay-result.json
 	grep -q '"family_pairs": \[' $(BUILD)/domain-replay-result.json
 	grep -q '"node_decision":"initial"' $(BUILD)/domain-replay-result.json
+	$(BUILD)/affinity-run preflight --config tests/runtime.toml --thread-profile tests/fixtures/thread-profile-small.json
+	$(BUILD)/affinity-run preflight --config tests/runtime.toml --cpus 0-3
 	$(BUILD)/affinity-run run --config tests/runtime.toml -- $(BUILD)/supervisor-test
 	sh tests/supervisor_test.sh
 

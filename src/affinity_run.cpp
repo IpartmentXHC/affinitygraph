@@ -43,7 +43,7 @@ struct Arguments {
 
 Arguments parse(int argc, char **argv) {
   if (argc < 2)
-    throw std::runtime_error("usage: affinity-run preflight|run --config PATH [--thread-profile PATH] [--profile-output PATH] [--experiment-id ID] [--test-id ID] [--bpf-object PATH] [--user USER] [-- command ...]");
+    throw std::runtime_error("usage: affinity-run preflight|run --config PATH [--cpus LIST] [--thread-profile PATH] [--profile-output PATH] [--experiment-id ID] [--test-id ID] [--bpf-object PATH] [--user USER] [-- command ...]");
   Arguments args;
   args.action = argv[1];
   for (int i = 2; i < argc; ++i) {
@@ -57,11 +57,11 @@ Arguments parse(int argc, char **argv) {
       std::string value = argv[++i];
       if (arg == "--config") args.config = value;
       else if (arg == "--bpf-object") args.bpf_object = value;
-      else if (arg == "--user") if (arg == "--user") args.user = value;
+      else if (arg == "--user") args.user = value;
       else if (arg == "--thread-profile") args.thread_profile = value;
       else if (arg == "--profile-output") args.profile_output = value;
       else if (arg == "--experiment-id") args.experiment_id = value;
-      else args.test_id = value;
+      else if (arg == "--test-id") args.test_id = value;
       else args.cpus = value;
     } else throw std::runtime_error("unknown or incomplete option: " + arg);
   }
@@ -355,10 +355,20 @@ void install_signal_handlers() {
 
 int preflight(const Arguments &args) {
   Config config = load_config(args.config, args.cpus);
-  if (!args.thread_profile.empty()) load_thread_profile(args.thread_profile, config.cpus);
+  if (!args.thread_profile.empty()) config.thread_profile_path = args.thread_profile;
   auto available = current_envelope();
   bool ok = true;
   std::cout << "config: ok\n";
+  if (!config.thread_profile_path.empty()) {
+    try {
+      auto profile = load_thread_profile(config.thread_profile_path, config.cpus);
+      std::cout << "thread_profile: ok (" << profile.placements.size() << " placement rule(s), "
+                << (profile.dynamic.enabled ? "dynamic" : "static") << ")\n";
+    } catch (const std::exception &error) {
+      std::cout << "thread_profile: fail (" << error.what() << ")\n";
+      ok = false;
+    }
+  }
   if (!subset(config.cpus, available)) {
     std::cout << "cpu_envelope: fail (outside startup/cgroup mask "
               << format_cpu_list(available) << ")\n";
@@ -385,10 +395,10 @@ int preflight(const Arguments &args) {
 }
 
 int supervise(const Arguments &args, Config config) {
-  config.thread_profile_path = args.thread_profile;
-  config.profile_output_path = args.profile_output;
-  config.experiment_id = args.experiment_id;
-  config.test_id = args.test_id;
+  if (!args.thread_profile.empty()) config.thread_profile_path = args.thread_profile;
+  if (!args.profile_output.empty()) config.profile_output_path = args.profile_output;
+  if (!args.experiment_id.empty()) config.experiment_id = args.experiment_id;
+  if (!args.test_id.empty()) config.test_id = args.test_id;
   if (!subset(config.cpus, current_envelope()))
     throw std::runtime_error("configured CPU envelope exceeds startup/cgroup affinity");
   if (args.command.empty()) throw std::runtime_error("run requires -- command ...");

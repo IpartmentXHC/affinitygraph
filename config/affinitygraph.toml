@@ -28,6 +28,12 @@ active_demand_threshold = 0.05
 inactive_demand_threshold = 0.0
 log_directory = "/var/log/affinitygraph"
 socket_path = "/run/affinitygraph/control.sock"
+# Optional thread placement profile. CLI --thread-profile and the
+# AFFINITY_THREAD_PROFILE environment variable take precedence over this path.
+# thread_profile = "/etc/affinitygraph/profiles/db.json"
+# profile_output = "/var/log/affinitygraph/profiles/thread-profile-candidate.json"
+# experiment_id = ""
+# test_id = ""
 
 [resources]
 # Optional. CLI --cpus and AFFINITY_CPUS take precedence. If omitted, the

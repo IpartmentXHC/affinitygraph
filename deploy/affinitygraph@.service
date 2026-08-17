@@ -12,13 +12,14 @@ EnvironmentFile=-/etc/affinitygraph/targets/%i.env
 Environment=TARGET_CONFIG=/etc/affinitygraph/targets/%i.toml
 Environment=TARGET_SOCKET=/run/affinitygraph-%i/control.sock
 Environment=TARGET_LOG_DIRECTORY=/var/log/affinitygraph-%i
+Environment=AFFINITYGRAPH_CALIBRATION_FILE=/etc/affinitygraph/calibration/hardware-node-edges.csv
 
 RuntimeDirectory=affinitygraph-%i
 RuntimeDirectoryMode=0750
 LogsDirectory=affinitygraph-%i
 LogsDirectoryMode=0750
 
-ExecStartPre=/usr/bin/test -s /etc/affinitygraph/calibration/hardware-node-edges.csv
+ExecStartPre=/usr/bin/test -s ${AFFINITYGRAPH_CALIBRATION_FILE}
 ExecStartPre=/usr/sbin/affinity-run preflight --config ${TARGET_CONFIG} --bpf-object /usr/lib/affinitygraph/affinitygraph.bpf.o
 ExecStart=/usr/libexec/affinitygraph/target-wrapper %i
 ExecStop=/usr/bin/affinityctl pause --socket ${TARGET_SOCKET}

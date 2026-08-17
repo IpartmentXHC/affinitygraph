@@ -114,6 +114,10 @@ Config load_config(const std::string &path, const std::string &cpu_override) {
     else if (key == "resources.calibration_path") c.calibration_path = unquote(value);
     else if (key == "runtime.log_directory") c.log_directory = unquote(value);
     else if (key == "runtime.socket_path") c.socket_path = unquote(value);
+    else if (key == "runtime.thread_profile") c.thread_profile_path = unquote(value);
+    else if (key == "runtime.profile_output") c.profile_output_path = unquote(value);
+    else if (key == "runtime.experiment_id") c.experiment_id = unquote(value);
+    else if (key == "runtime.test_id") c.test_id = unquote(value);
     else if (key == "runtime.sample_interval_seconds") c.sample_interval_seconds = std::stoi(value);
     else if (key == "runtime.graph_horizon_seconds") c.graph_horizon_seconds = std::stoi(value);
     else if (key == "runtime.solve_interval_seconds") c.solve_interval_seconds = std::stoi(value);
@@ -188,6 +192,12 @@ Config load_config(const std::string &path, const std::string &cpu_override) {
     c.cpus = parse_cpu_list(env);
   } else if (!cpus_from_toml) {
     c.cpus = detect_allowed_cpus();
+  }
+  // Thread profile path: CLI --thread-profile wins over AFFINITY_THREAD_PROFILE,
+  // which wins over runtime.thread_profile in TOML.
+  if (const char *env = std::getenv("AFFINITY_THREAD_PROFILE");
+      env != nullptr && *env != '\0') {
+    c.thread_profile_path = env;
   }
   if (c.cpus.empty()) throw std::runtime_error("CPU envelope is empty");
   if (c.sample_interval_seconds < 1 || c.graph_horizon_seconds < c.sample_interval_seconds ||
