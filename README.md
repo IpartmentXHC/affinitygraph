@@ -31,3 +31,6 @@ mask deltas.
 
 Selector 模块到源文件的映射、输入输出字段和快速日志查询见
 [`docs/selector-modules.md`](docs/selector-modules.md)。
+
+不使用 YBA、手动启动 Doris + YCSB 的两种压测方式（带放置文件 / 动态
+solver）见 [`docs/doris-manual-testing.md`](docs/doris-manual-testing.md)。
