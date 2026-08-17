@@ -314,42 +314,176 @@ sudo -A head -8 /var/log/affinitygraph-doris/profiles/doris-r1.candidate.json
 ## 3. 场景 B：无放置文件（动态 solver）
 
 适用：冷启动探索，让 runtime 自己基于关系证据做放置。
+按 observe → plan → active 三段推进，每次切换**都要重启 supervisor**（
+affinity-run 必须自己拉起 Doris）。注意：Ctrl+C 停掉 supervisor 后，
+Doris 的 FE/BE daemon（`setsid` 脱离进程组）**仍然存活**，切换模式前要
+手动 `stop_fe.sh`/`stop_be.sh`。
 
-### 3.1 observe（先看证据，不动手）
-
-配置 `mode = "observe"`，按第 1 节启动（**不带** `--thread-profile`），跑
-YCSB 负载。此时 runtime 只采样/建图/记录，不迁移任何线程：
+### 3.1 前置确认与配置（observe 起步）
 
 ```sh
-grep -E '"type":"(solve_window_end|plan|family|domain)"' \
-  /var/log/affinitygraph-doris/runtime.jsonl | tail -30
-# observe 模式 solve 输出 outcome:"observed"，不会提交
+# 1) 构建产物与 BPF 就绪（同场景 A 2.1）
+ls -l build/affinity-run build/affinitygraph.bpf.o
+sudo -A ./build/affinity-run preflight \
+  --config config/affinitygraph.toml \
+  --bpf-object build/affinitygraph.bpf.o
+
+# 2) 停掉旧 Doris（如正在运行）
+/opt/doris/fe/bin/stop_fe.sh || true
+/opt/doris/be/bin/stop_be.sh || true
+
+sudo -A mkdir -p /etc/affinitygraph/targets
+sudo -A mkdir -p /var/log/affinitygraph-doris
 ```
 
-### 3.2 plan（shadow 验证）
+```sh
+sudo -A tee /etc/affinitygraph/targets/doris.toml >/dev/null <<'EOF'
+[runtime]
+mode = "observe"                   # 先 observe；后续手动改为 plan / active
+sample_interval_seconds = 1
+graph_horizon_seconds = 60
+solve_interval_seconds = 10
+minimum_confidence = 0.8
+proposal_confirmations = 3
+solver = "incremental-hotspot-v1"
+affinity_granularity = "singleton_cpu"
+maximum_managed_threads = 128      # Doris 线程多时按需调大
+log_directory = "/var/log/affinitygraph-doris"
+socket_path = "/tmp/affinitygraph-doris.sock"
 
-`mode = "plan"` 重启（或改配置后重启），观察 solver 的 shadow 决策：
-`solve_window_end`/`plan` 记录会给出目标放置；`affinityctl dump` 中
-`planned_threads` 不为 0 时表示有影子计划。此模式不执行任何 `sched_setaffinity`。
+[resources]
+calibration_path = "/etc/affinitygraph/calibration"
 
-### 3.3 active（真正迁移）
+[collector]
+required = true
+pthread_uprobe = true
 
-`mode = "active"` 重启。runtime 会按 `incremental-hotspot-v1`
-（默认 singleton_cpu 粒度）自动迁移热点线程：
+[calibration]
+# 关系证据归一化会用到这些尺度（graph.cpp），正式实验请替换为
+# 经评审的离线尺度，不要沿用 ClickHouse 默认值
+id = "doris-manual-test"
+activity_log_p95 = 1.0
+sync_log_p95 = 1.0
+share_log_p95 = 1.0
+EOF
+```
+
+### 3.2 启动 observe（终端 1，**不带** --thread-profile）
 
 ```sh
-# 看每次 action：迁移数量、committed、success
-grep -E '"type":"(action|plan|solve_window_end|collector_health)"' \
+sudo -A ./build/affinity-run run \
+  --config /etc/affinitygraph/targets/doris.toml \
+  --bpf-object build/affinitygraph.bpf.o \
+  --user doris \
+  -- bash -c '/opt/doris/fe/bin/start_fe.sh --daemon \
+               && /opt/doris/be/bin/start_be.sh --daemon \
+               && wait'
+```
+
+### 3.3 观察证据（终端 2 + 终端 3 打 YCSB 负载）
+
+```sh
+# 终端 3：起 YCSB 负载（同场景 A 2.9）
+./bin/ycsb run jdbc -P workloads/workloada \
+  -p jdbc.url="jdbc:mysql://127.0.0.1:9030/testdb" \
+  -p jdbc.user=root -p jdbc.password='' \
+  -p operationcount=1000000 -threads 32
+```
+
+```sh
+# 终端 2：等待窗口建立，观察关系证据
+sleep 30
+sudo -A grep -E '"type":"(solve_window_begin|selector_input|selector_output|relation_edge_summary|solve_window_end)"' \
   /var/log/affinitygraph-doris/runtime.jsonl | tail -40
+# observe 模式 solve_window_end 应输出 "outcome":"observed"，不提交任何放置
 
 sudo -A ./build/affinityctl status --socket /tmp/affinitygraph-doris.sock
-sudo -A ./build/affinityctl dump  --socket /tmp/affinitygraph-doris.sock
+# 关注 "bpf":true、"collector_degraded":false、"target_tgids" 覆盖 FE+BE
 ```
 
-- 需要 `affinity_capability=true`（保留 CAP_SYS_NICE），否则 active 无法
-  迁移；`runtime_start` 日志里有该字段。
-- 停止前同样先 `affinityctl pause`，然后确认 restore 日志：
-  `"restore_requested"`/`"restore_restored"` 数量一致且 100%。
+### 3.4 切换 plan（shadow 验证，不执行迁移）
+
+```sh
+# 1) 终端 1 按 Ctrl+C 停 supervisor，然后停 Doris
+/opt/doris/fe/bin/stop_fe.sh || true
+/opt/doris/be/bin/stop_be.sh || true
+
+# 2) 改 mode
+sudo -A sed -i 's/^mode = .*/mode = "plan"/' /etc/affinitygraph/targets/doris.toml
+sudo -A grep '^mode' /etc/affinitygraph/targets/doris.toml
+
+# 3) 终端 1 重新启动（同 3.2 命令），终端 3 重新打负载
+```
+
+```sh
+# 终端 2：观察 shadow 决策
+sleep 30
+sudo -A grep -E '"type":"(plan|shadow_commit|solve_window_end)"' \
+  /var/log/affinitygraph-doris/runtime.jsonl | tail -40
+# plan 模式期望 outcome:"planned" / "shadow_committed"，无 action 日志
+
+sudo -A ./build/affinityctl status --socket /tmp/affinitygraph-doris.sock
+# "planned_assignments"/"planned_masks" 非空 = 有影子计划；
+# action_requested/action_committed 应保持 0
+```
+
+### 3.5 切换 active（真正迁移）
+
+```sh
+# 1) 终端 1 Ctrl+C → 停 Doris → 改 mode
+/opt/doris/fe/bin/stop_fe.sh || true
+/opt/doris/be/bin/stop_be.sh || true
+sudo -A sed -i 's/^mode = .*/mode = "active"/' /etc/affinitygraph/targets/doris.toml
+sudo -A grep '^mode' /etc/affinitygraph/targets/doris.toml
+
+# 2) 终端 1 重新启动（同 3.2 命令），终端 3 重新打负载
+```
+
+```sh
+# 终端 2：等待策略武装并观察迁移动作
+sleep 30
+sudo -A grep -E '"type":"(action|action_commit|actuator_output|solve_window_end)"' \
+  /var/log/affinitygraph-doris/runtime.jsonl | tail -40
+# active 期望 solve_window_end outcome:"action_committed"，action/action_commit 记录迁移
+
+sudo -A ./build/affinityctl status --socket /tmp/affinitygraph-doris.sock
+# 期望 "policy_armed":true、"active_effective":true（需 selector_ready 且 BPF 健康
+# 窗口 loss<1%）；"pinned_threads":N、"action_requested"=="action_committed"
+```
+
+```sh
+# 抽查内核实际掩码（从 action/plan 日志挑一个受管 tid）
+TID=12345
+sudo -A sh -c "grep Cpus_allowed_list /proc/$TID/status"
+```
+
+### 3.6 结束实验
+
+```sh
+# 1) 先 pause，同步恢复全部掩码
+sudo -A ./build/affinityctl pause --socket /tmp/affinitygraph-doris.sock
+# "restore_requested":N,"restore_restored":N 应相等
+
+# 2) 终端 1 Ctrl+C 收尾
+# 3) 核对 runtime_stop 的 restore 计数
+sudo -A grep -E '"type":"(pause|runtime_stop)"' \
+  /var/log/affinitygraph-doris/runtime.jsonl | tail
+
+# 4) 停掉未被监督的 Doris daemon（可选，按实验需要）
+/opt/doris/fe/bin/stop_fe.sh || true
+/opt/doris/be/bin/stop_be.sh || true
+```
+
+### 3.7 场景 B 排障
+
+- `solve_window_end outcome:"waiting_bpf_health"`：BPF 健康窗口未就绪
+  （loss 需 <1%），等 `bpf_window_ready:true` 再看。
+- `policy_armed/active_effective` 一直 false：检查 `selector_ready`、
+  `paused`、`fatal_error`、`affinity_capability`（active 需保留 CAP_SYS_NICE）。
+- `outcome:"action_failed"`/`"actions_vanished"`：迁移失败/线程已消失，看
+  `actuator_output` 与 `action` 日志的错误字段。
+- 迁移数量为 0：`maximum_managed_threads` 太小或 demand 未达
+  `active_demand_threshold`，看 `active_cohort` 日志。
 
 ## 4. 结果与日志速查
 
