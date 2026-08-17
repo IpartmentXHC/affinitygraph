@@ -14,12 +14,27 @@ make bpf CLANG=/usr/bin/clang-18
 sudo make install
 ```
 
-Copy the platform's reviewed `hardware-node-edges.csv` into
+Generate or copy the platform's reviewed `hardware-node-edges.csv` into
 `/etc/affinitygraph/calibration/` (or set `resources.calibration_path` in the
 target config). Its schema records firmware distance, handoff latency,
 serialized memory latency, and STREAM bandwidth separately. Both the 10-column
 schema and the 11-column schema ending in `is_estimated` are accepted. Only
 handoff latency and firmware distance enter the active CPU objective.
+
+The CPU latency benchmark is vendored under `dep/core-to-core-latency/`
+(see `dep/README.md` for the full external-dependency manifest). Regenerate the
+platform calibration on the target host with:
+
+```sh
+sudo make calibrate
+```
+
+`make calibrate` builds the vendored benchmark offline from
+`dep/core-to-core-latency/vendor/` and writes the 11-column CSV to
+`/etc/affinitygraph/calibration/hardware-node-edges.csv`. For production-grade
+values supply `--p95-csv`/`--memory-csv`/`--stream-csv`/`--stream-bin` through
+`scripts/generate_calibration.sh`; heuristic estimates are flagged by the
+`is_estimated` column.
 
 ## Target configuration (generic supervisor)
 
