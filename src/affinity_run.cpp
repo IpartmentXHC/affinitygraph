@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -278,19 +279,20 @@ public:
     for (const auto &path : candidates) {
       bpf_uprobe_opts entry{};
       entry.sz = offsetof(bpf_uprobe_opts, reserved);
-      entry.func_name = "pthread_create";
-      bpf_link *first = api_.attach_uprobe(pthread_entry_, -1, path.c_str(), 0, &entry);
+      const size_t offset = resolve_symbol_offset(path, "pthread_create");
+      if (!offset) entry.func_name = "pthread_create";
+      bpf_link *first = api_.attach_uprobe(pthread_entry_, -1, path.c_str(), offset, &entry);
       if (!first || api_.get_error(first)) continue;
       bpf_uprobe_opts ret = entry;
       ret.retprobe = true;
-      bpf_link *second = api_.attach_uprobe(pthread_return_, -1, path.c_str(), 0, &ret);
+      bpf_link *second = api_.attach_uprobe(pthread_return_, -1, path.c_str(), offset, &ret);
       if (!second || api_.get_error(second)) {
         api_.destroy_link(first);
         continue;
       }
       links_.push_back(first);
       links_.push_back(second);
-      return "attached:" + path;
+      return "attached:" + path + (offset ? " (resolved offset)" : " (symbol name)");
     }
     return "unavailable: pthread_create symbol not attachable";
   }
@@ -314,6 +316,50 @@ public:
   ~BpfSession() { reset(); }
 
 private:
+  // Resolve the ELF file offset of `symbol` inside the shared library at
+  // `path`. glibc >= 2.34 merged libpthread into libc, so pthread_create has
+  // multiple version aliases (e.g. GLIBC_2.2.5 and GLIBC_2.34) and libbpf's
+  // symbol-name lookup fails with "ambiguous match". Attaching by the resolved
+  // offset avoids that lookup entirely. Returns 0 when the offset cannot be
+  // resolved (the caller then falls back to symbol-name attach).
+  size_t resolve_symbol_offset(const std::string &path, const char *symbol) {
+    void *handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!handle) return 0;
+    void *address = dlsym(handle, symbol);
+    if (!address) {
+      dlclose(handle);
+      return 0;
+    }
+    const uintptr_t target = reinterpret_cast<uintptr_t>(address);
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    size_t offset = 0;
+    while (std::getline(maps, line)) {
+      auto dash = line.find('-');
+      if (dash == std::string::npos) continue;
+      auto space = line.find(' ', dash);
+      if (space == std::string::npos) continue;
+      const uintptr_t start = std::stoull(line.substr(0, dash), nullptr, 16);
+      const uintptr_t end = std::stoull(line.substr(dash + 1, space - dash - 1), nullptr, 16);
+      if (target < start || target >= end) continue;
+      auto slash = line.find('/');
+      if (slash == std::string::npos || line.substr(slash) != path) continue;
+      size_t pos = space + 1;
+      while (pos < line.size() && line[pos] == ' ') ++pos;
+      auto perm_end = line.find(' ', pos);
+      if (perm_end == std::string::npos) continue;
+      pos = perm_end + 1;
+      while (pos < line.size() && line[pos] == ' ') ++pos;
+      auto off_end = line.find(' ', pos);
+      if (off_end == std::string::npos) continue;
+      const uintptr_t file_offset = std::stoull(line.substr(pos, off_end - pos), nullptr, 16);
+      offset = static_cast<size_t>(target - start + file_offset);
+      break;
+    }
+    dlclose(handle);
+    return offset;
+  }
+
   int map_fd(const char *name) {
     bpf_map *map = api_.find_map(object_, name);
     return map ? api_.map_fd(map) : -1;
@@ -405,6 +451,20 @@ int supervise(const Arguments &args, Config config) {
   std::vector<char *> command = args.command;
   command.push_back(nullptr);
   Identity identity = resolve_identity(args.user);
+  // 日志目录必须在降权前创建：Runtime 在 drop_identity 之后才打开
+  // runtime.jsonl，若目录不存在会以目标用户身份创建 /var/log 失败。
+  if (!config.log_directory.empty()) {
+    std::error_code ec;
+    fs::create_directories(config.log_directory, ec);
+    if (ec)
+      throw std::runtime_error("cannot create log directory " +
+                               config.log_directory + ": " + ec.message());
+    if (geteuid() == 0 &&
+        ::chown(config.log_directory.c_str(), identity.uid, identity.gid) != 0)
+      throw std::runtime_error("cannot chown log directory " +
+                               config.log_directory + ": " +
+                               std::string(std::strerror(errno)));
+  }
   std::string bpf_reason;
   BpfSession bpf;
   bool bpf_ready = bpf_available(args.bpf_object, bpf_reason) &&

@@ -302,7 +302,102 @@ sudo -A grep -E '"type":"(pause|runtime_stop|profile_export)"' \
 sudo -A head -8 /var/log/affinitygraph-doris/profiles/doris-r1.candidate.json
 ```
 
-### 2.11 场景 A 排障
+### 2.11 进阶：profile 初始放置 + active 动态微调
+
+纯静态版（2.5 的 `dynamic.enabled=false`）会让 solver 直接
+`profile_static_hold` 跳过。把 profile 顶层 `dynamic.enabled` 改为 `true`
+后，profile 的初始放置照常落地（`initial_affinity`），solver 再在其之上做
+增量调整 —— 即"初始方案 + 小范围动态调整"。
+
+注意两点现状：
+- placement 级 `dynamic` 字段与 dynamic 节的
+  `small_step_threads/large_change_ratio/large_step_threads/cooldown_seconds`
+  目前只解析与导出，solver 尚未消费；
+- `incremental-hotspot-v1` 不读 profile 的 `allowed_cpus`，理论上可把线程
+  迁到信封内其他 node；实际"调整幅度"由 TOML 旋钮控制：
+  `maximum_migrated_threads_ratio`（每窗口迁移比例）、
+  `proposal_confirmations`（连续一致才执行）、`minimum_dwell_seconds`
+  （迁移后驻留）、`maximum_threads_per_cpu`（每 CPU 线程上限）。
+
+```sh
+# 1) 复制 profile 并打开顶层 dynamic（sed 只命中顶层 "enabled"，不影响
+#    placement 级 "dynamic": false）
+sudo -A mkdir -p /etc/affinitygraph/profiles
+sudo -A cp config/thread-profiles/doris-light-pipe-node2-c4t4.candidate.json \
+  /etc/affinitygraph/profiles/doris-node2-dynamic.candidate.json
+sudo -A sed -i 's/"enabled": false/"enabled": true/' \
+  /etc/affinitygraph/profiles/doris-node2-dynamic.candidate.json
+sudo -A grep -n '"enabled"' \
+  /etc/affinitygraph/profiles/doris-node2-dynamic.candidate.json
+
+# 2) 写配置：mode="active" + 收紧动态幅度的旋钮
+sudo -A tee /etc/affinitygraph/targets/doris.toml >/dev/null <<'EOF'
+[runtime]
+mode = "active"
+sample_interval_seconds = 1
+graph_horizon_seconds = 60
+solve_interval_seconds = 10
+minimum_confidence = 0.8
+proposal_confirmations = 3
+initial_proposal_confirmations = 1
+solver = "incremental-hotspot-v1"
+affinity_granularity = "singleton_cpu"
+maximum_managed_threads = 128
+maximum_migrated_threads_ratio = 0.05   # 每窗口最多动 5% 受管线程
+minimum_dwell_seconds = 60              # 迁移后至少驻留 60s
+maximum_threads_per_cpu = 4             # 每 CPU 线程上限（按需）
+log_directory = "/var/log/affinitygraph-doris"
+socket_path = "/tmp/affinitygraph-doris.sock"
+
+[resources]
+calibration_path = "/etc/affinitygraph/calibration"
+
+[collector]
+required = true
+pthread_uprobe = true
+
+[calibration]
+id = "doris-manual-test"
+activity_log_p95 = 1.0
+sync_log_p95 = 1.0
+share_log_p95 = 1.0
+EOF
+
+# 3) preflight：期望 thread_profile: ok (2 placement rule(s), dynamic)
+sudo -A ./build/affinity-run preflight \
+  --config /etc/affinitygraph/targets/doris.toml \
+  --thread-profile /etc/affinitygraph/profiles/doris-node2-dynamic.candidate.json \
+  --bpf-object build/affinitygraph.bpf.o
+
+# 4) 启动（终端 1）
+sudo -A ./build/affinity-run run \
+  --config /etc/affinitygraph/targets/doris.toml \
+  --thread-profile /etc/affinitygraph/profiles/doris-node2-dynamic.candidate.json \
+  --profile-output /etc/affinitygraph/profiles/doris-node2-dynamic.export.json \
+  --experiment-id 20260817-doris-profile-dynamic \
+  --test-id hybrid-active-v1 \
+  --bpf-object build/affinitygraph.bpf.o \
+  -- bash -c '/opt/doris/fe/bin/start_fe.sh --daemon \
+               && /opt/doris/be/bin/start_be.sh --daemon \
+               && wait'
+
+# 5) 终端 3：YCSB 负载（同 2.9）
+
+# 6) 终端 2：验证"先初始放置、后动态微调"
+sleep 30
+sudo -A grep -E '"type":"(profile_load|profile_match|initial_affinity|plan|action|action_commit|solve_window_end)"' \
+  /var/log/affinitygraph-doris/runtime.jsonl | tail -60
+# 期望：profile_match → initial_affinity committed（初始放置）；
+# 之后 plan confirmation 递增 → ready，solve_window_end outcome:"action_committed"
+# （动态微调，迁移量受 maximum_migrated_threads_ratio 限制）
+
+sudo -A ./build/affinityctl status --socket /tmp/affinitygraph-doris.sock
+# dynamic.enabled=true 时 selector_ready 会置位，期望 active_effective:true
+```
+
+结束实验与导出同 2.10。
+
+### 2.12 场景 A 排障
 
 - `profile_load "success":false`：profile 路径/信封/status 非法，看 `error` 字段。
 - `profile_match "outcome":"empty_allowed_intersection"`：该线程的
@@ -318,6 +413,10 @@ sudo -A head -8 /var/log/affinitygraph-doris/profiles/doris-r1.candidate.json
 affinity-run 必须自己拉起 Doris）。注意：Ctrl+C 停掉 supervisor 后，
 Doris 的 FE/BE daemon（`setsid` 脱离进程组）**仍然存活**，切换模式前要
 手动 `stop_fe.sh`/`stop_be.sh`。
+
+> 真实环境不需要三段推进：`mode = "active"` 内部已经包含采样 → 计算 →
+> 执行 的自动闭环（见 3.6）。observe/plan 只用于离线验证与干跑，正式
+> 部署直接跳到 3.6。
 
 ### 3.1 前置确认与配置（observe 起步）
 
@@ -457,7 +556,107 @@ TID=12345
 sudo -A sh -c "grep Cpus_allowed_list /proc/$TID/status"
 ```
 
-### 3.6 结束实验
+### 3.6 一步到位 active（真实环境，推荐）
+
+直接从 active 起步：runtime 每 `sample_interval_seconds`（默认 1s）采样，
+每 `solve_interval_seconds`（默认 10s）计算一次方案并执行。前 1~3 分钟是
+证据积累期（`graph_horizon_seconds`=60s + `proposal_confirmations`=3），
+`plan` 日志 `confirmation` 连续达成后才出现 `outcome:"action_committed"`。
+
+```sh
+# 0) 构建产物与 BPF 就绪（若已 make all 可跳过）
+cd /data/kunpeng-affinity/affinitygraph
+make all CXX=/usr/bin/clang++-18 CLANG=/usr/bin/clang-18
+ls -l build/affinity-run build/affinitygraph.bpf.o
+
+# 1) 停掉旧 Doris，建目录
+/opt/doris/fe/bin/stop_fe.sh || true
+/opt/doris/be/bin/stop_be.sh || true
+sudo -A mkdir -p /etc/affinitygraph/targets /var/log/affinitygraph-doris
+```
+
+```sh
+# 2) 写配置：mode 直接为 active（动态 solver）
+sudo -A tee /etc/affinitygraph/targets/doris.toml >/dev/null <<'EOF'
+[runtime]
+mode = "active"                    # 采样+计算+执行 一步到位
+sample_interval_seconds = 1
+graph_horizon_seconds = 60
+solve_interval_seconds = 10
+minimum_confidence = 0.8
+proposal_confirmations = 3
+initial_proposal_confirmations = 1
+solver = "incremental-hotspot-v1"
+affinity_granularity = "singleton_cpu"
+maximum_managed_threads = 128      # Doris 线程多时按需调大
+active_demand_threshold = 0.05
+inactive_demand_threshold = 0.0
+log_directory = "/var/log/affinitygraph-doris"
+socket_path = "/tmp/affinitygraph-doris.sock"
+
+[resources]
+calibration_path = "/etc/affinitygraph/calibration"
+
+[collector]
+required = true
+pthread_uprobe = true
+
+[calibration]
+id = "doris-manual-test"
+activity_log_p95 = 1.0
+sync_log_p95 = 1.0
+share_log_p95 = 1.0
+EOF
+sudo -A grep -E '^(mode|solve_interval_seconds|maximum_managed_threads)' \
+  /etc/affinitygraph/targets/doris.toml
+```
+
+```sh
+# 3) preflight 校验（期望 config/cpu_envelope/kernel/bpf 全 ok）
+sudo -A ./build/affinity-run preflight \
+  --config /etc/affinitygraph/targets/doris.toml \
+  --bpf-object build/affinitygraph.bpf.o
+```
+
+```sh
+# 4) 终端 1：启动 active（不带 --thread-profile，让动态 solver 自己放）
+sudo -A ./build/affinity-run run \
+  --config /etc/affinitygraph/targets/doris.toml \
+  --bpf-object build/affinitygraph.bpf.o \
+  --user doris \
+  -- bash -c '/opt/doris/fe/bin/start_fe.sh --daemon \
+               && /opt/doris/be/bin/start_be.sh --daemon \
+               && wait'
+```
+
+```sh
+# 5) 终端 3：起 YCSB 负载（正式测量，持续打）
+./bin/ycsb run jdbc -P workloads/workloada \
+  -p jdbc.url="jdbc:mysql://127.0.0.1:9030/testdb" \
+  -p jdbc.user=root -p jdbc.password='' \
+  -p operationcount=1000000 -threads 32
+```
+
+```sh
+# 6) 终端 2：等 1~3 分钟证据积累，观察自动闭环
+sleep 30
+sudo -A ./build/affinityctl status --socket /tmp/affinitygraph-doris.sock
+# 期望 effective_mode:"active"、bpf:true、collector_degraded:false、
+# 证据足够后 active_effective:true、planned_threads 非空
+
+sudo -A grep -E '"type":"(solve_window_begin|plan|action|action_commit|active_cohort|solve_window_end)"' \
+  /var/log/affinitygraph-doris/runtime.jsonl | tail -60
+# 期望 plan 日志 confirmation 递增 → 1，然后 solve_window_end
+# outcome:"action_committed"；action/action_commit 记录每次迁移
+```
+
+```sh
+# 7) 抽查内核实际掩码（从 action/plan 日志挑一个受管 tid）
+TID=12345
+sudo -A sh -c "grep Cpus_allowed_list /proc/$TID/status"
+```
+
+### 3.7 结束实验
 
 ```sh
 # 1) 先 pause，同步恢复全部掩码
@@ -474,7 +673,7 @@ sudo -A grep -E '"type":"(pause|runtime_stop)"' \
 /opt/doris/be/bin/stop_be.sh || true
 ```
 
-### 3.7 场景 B 排障
+### 3.8 场景 B 排障
 
 - `solve_window_end outcome:"waiting_bpf_health"`：BPF 健康窗口未就绪
   （loss 需 <1%），等 `bpf_window_ready:true` 再看。
@@ -499,6 +698,12 @@ sudo -A grep -E '"type":"(pause|runtime_stop)"' \
 - **`bpf: fail (compiled CO-RE object is missing)`**：先 `make all` 生成
   `build/affinitygraph.bpf.o`，并确认 preflight 与 make 在同一目录执行（相对
   路径依赖 CWD），或改用绝对路径。
+- **stderr 出现 `libbpf: elf: ambiguous match for 'pthread_create'`**：glibc
+  ≥ 2.34 合并 libpthread 后 `pthread_create` 在 `libc.so.6` 里有多个版本别名，
+  libbpf 按符号名挂 uprobe 会解析失败。已改为 dlsym 解析地址 + ELF offset
+  挂载（`src/affinity_run.cpp`），重新 `make all` 后 `status` 的
+  `pthread_uprobe` 应显示 `attached:... (resolved offset)`；旧的
+  `(symbol name)` 表示回退到了符号名路径，需检查 libc 路径一致性。
 - **`cpu_envelope: fail`**：配置的信封超出了启动时 cgroup/进程亲和掩码；
   用 `--cpus` 或 `AFFINITY_CPUS` 收窄，或调整启动掩码。
 - **`collector_degraded=true`**：BPF 未生效（未传 `--bpf-object`、非 root、
