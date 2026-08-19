@@ -82,6 +82,8 @@ test: all
 	grep -q '"node_decision":"initial"' $(BUILD)/domain-replay-result.json
 	$(BUILD)/affinity-run preflight --config tests/runtime.toml --thread-profile tests/fixtures/thread-profile-small.json
 	$(BUILD)/affinity-run preflight --config tests/runtime.toml --cpus 0-3
+	$(BUILD)/affinity-run preflight --config tests/fixtures/config-static-sample0.toml --thread-profile tests/fixtures/thread-profile-small.json
+	$(BUILD)/affinity-run preflight --config tests/fixtures/config-static-sample0.toml && exit 1 || true
 	$(BUILD)/affinity-run run --config tests/runtime.toml -- $(BUILD)/supervisor-test
 	sh tests/supervisor_test.sh
 

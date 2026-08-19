@@ -149,12 +149,14 @@ sudo -A mkdir -p /var/log/affinitygraph-doris/profiles
 sudo -A tee /etc/affinitygraph/targets/doris.toml >/dev/null <<'EOF'
 [runtime]
 mode = "active"                    # 静态放置只有在 active 才会真正落盘
-sample_interval_seconds = 1
+dynamic = false                    # 只做静态放置，跳过 solver（无需改 profile）
+sample_interval_seconds = 1        # 0 = 静止后停止采样（需 static，见下文说明）
 graph_horizon_seconds = 60
 solve_interval_seconds = 10
 minimum_confidence = 0.8
 proposal_confirmations = 3
 solver = "incremental-hotspot-v1"  # 静态保持会跳过 solver，值不影响
+static_quiescent_windows = 3       # sample=0 时连续无新命中 N 窗后停采样
 affinity_granularity = "singleton_cpu"
 maximum_managed_threads = 128
 log_directory = "/var/log/affinitygraph-doris"
@@ -174,6 +176,16 @@ sync_log_p95 = 1.0
 share_log_p95 = 1.0
 EOF
 ```
+
+> `dynamic = false` 是静态开关：运行时强制静态，即使 profile 里
+> `dynamic.enabled=true` 也会被覆盖，无需手工改 profile 文件。缺省（不写该
+> 键）时仍由 profile 的 `dynamic.enabled` 决定。
+>
+> 采样频率：`sample_interval_seconds` 可调大（如 30~60s，静态模式下低频轮询，
+> 新线程仍会被放置）；设 `0` 则持续采样直到 profile 连续
+> `static_quiescent_windows`（默认 3）个窗口无新命中后彻底停止轮询
+> （`sampling_stopped`，此时只保留 control socket）。`sample_interval_seconds=0`
+> 仅静态模式合法，否则 preflight/启动会报 `sampling: fail`。
 
 ### 2.5 写放置文件 profile
 
@@ -308,6 +320,9 @@ sudo -A head -8 /var/log/affinitygraph-doris/profiles/doris-r1.candidate.json
 `profile_static_hold` 跳过。把 profile 顶层 `dynamic.enabled` 改为 `true`
 后，profile 的初始放置照常落地（`initial_affinity`），solver 再在其之上做
 增量调整 —— 即"初始方案 + 小范围动态调整"。
+
+> 反方向强制静态不需要改 profile：在 `[runtime]` 写 `dynamic = false` 即可
+> 覆盖 profile 里的 `dynamic.enabled=true`（2.4 的静态配置就是这么用的）。
 
 注意两点现状：
 - placement 级 `dynamic` 字段与 dynamic 节的
@@ -704,6 +719,13 @@ sudo -A grep -E '"type":"(pause|runtime_stop)"' \
   挂载（`src/affinity_run.cpp`），重新 `make all` 后 `status` 的
   `pthread_uprobe` 应显示 `attached:... (resolved offset)`；旧的
   `(symbol name)` 表示回退到了符号名路径，需检查 libc 路径一致性。
+- **preflight 报 `sampling: fail`**：`sample_interval_seconds=0` 要求静态
+  profile（`runtime.dynamic=false` 或 profile `dynamic.enabled=false`），
+  否则无法在静止后停止采样；去掉该键或改成低频值（如 30）即可。
+- **`status` 里 `sampling_stopped:true`**：静态 + `sample_interval_seconds=0`
+  时，profile 连续 `static_quiescent_windows` 个窗口无新命中后停止轮询
+  （日志出现 `sampling_stopped` 事件）。这是终态：`resume` 不会恢复采样，
+  需要新线程被放置时请用低频值或重启进程。
 - **`cpu_envelope: fail`**：配置的信封超出了启动时 cgroup/进程亲和掩码；
   用 `--cpus` 或 `AFFINITY_CPUS` 收窄，或调整启动掩码。
 - **`collector_degraded=true`**：BPF 未生效（未传 `--bpf-object`、非 root、

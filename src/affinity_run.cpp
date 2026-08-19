@@ -404,12 +404,17 @@ int preflight(const Arguments &args) {
   if (!args.thread_profile.empty()) config.thread_profile_path = args.thread_profile;
   auto available = current_envelope();
   bool ok = true;
+  bool profile_static_effective = false;
   std::cout << "config: ok\n";
   if (!config.thread_profile_path.empty()) {
     try {
       auto profile = load_thread_profile(config.thread_profile_path, config.cpus);
+      profile_static_effective = !profile.placements.empty() &&
+                                 (!config.dynamic || !profile.dynamic.enabled);
       std::cout << "thread_profile: ok (" << profile.placements.size() << " placement rule(s), "
-                << (profile.dynamic.enabled ? "dynamic" : "static") << ")\n";
+                << (profile_static_effective ? "static" : "dynamic")
+                << (!config.dynamic && profile.dynamic.enabled ? " (runtime.dynamic=false)" : "")
+                << ")\n";
     } catch (const std::exception &error) {
       std::cout << "thread_profile: fail (" << error.what() << ")\n";
       ok = false;
@@ -436,6 +441,16 @@ int preflight(const Arguments &args) {
   std::cout << "bpf: " << (bpf ? "ok" : config.bpf_required ? "fail" : "disabled")
             << " (" << reason << ")\n";
   std::cout << "pthread_uprobe: " << (config.pthread_uprobe ? "auto" : "off") << '\n';
+  if (config.sample_interval_seconds == 0) {
+    if (profile_static_effective) {
+      std::cout << "sampling: ok (static profile; stops after quiescence)\n";
+    } else {
+      std::cout << "sampling: fail (sample_interval_seconds=0 requires a static thread profile)\n";
+      ok = false;
+    }
+  } else {
+    std::cout << "sampling: ok (every " << config.sample_interval_seconds << "s)\n";
+  }
   if (config.bpf_required && !bpf) ok = false;
   return ok ? 0 : 1;
 }

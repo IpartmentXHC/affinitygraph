@@ -62,6 +62,17 @@ void test_cpu_lists() {
               production.candidate_hard_limit == 4 &&
               production.maximum_managed_threads == 128,
           "per-thread configuration parsed");
+  auto static_config = load_config("tests/fixtures/config-static-sample0.toml");
+  require(!static_config.dynamic && static_config.sample_interval_seconds == 0 &&
+              static_config.static_quiescent_windows == 3,
+          "static sample-zero configuration parsed");
+  bool invalid_rejected = false;
+  try {
+    load_config("tests/fixtures/config-static-sample0-invalid.toml");
+  } catch (const std::exception &) {
+    invalid_rejected = true;
+  }
+  require(invalid_rejected, "static_quiescent_windows < 1 rejected");
 }
 
 void test_thread_profile() {

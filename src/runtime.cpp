@@ -275,6 +275,8 @@ Runtime::Runtime(Config config, int root_pid, std::shared_ptr<BpfRingReader> bpf
       bpf_reader_(std::move(bpf_reader)), actuator_(backend_),
       solver_(config_.mode == Mode::Plan) {
   runtime_instance_id_ = monotonic_ns();
+  effective_sample_seconds_ = config_.sample_interval_seconds == 0
+                                  ? 1 : config_.sample_interval_seconds;
   hardware_.load_calibration(config_.calibration_path);
   target_tgids_.insert(root_pid_);
   if (collector_degraded_ ||
@@ -295,6 +297,10 @@ Runtime::Runtime(Config config, int root_pid, std::shared_ptr<BpfRingReader> bpf
           "\",\"success\":false,\"error\":\"" + json_escape(error.what()) + "\"");
     }
   }
+  if (config_.sample_interval_seconds == 0 && !static_profile_effective())
+    throw std::runtime_error(
+        "sample_interval_seconds=0 requires a static thread profile "
+        "(runtime.dynamic=false or profile dynamic.enabled=false)");
   open_control_socket();
   if (bpf_reader_) bpf_worker_ = std::thread([this] { run_bpf(); });
   worker_ = std::thread([this] { run(); });
@@ -469,8 +475,7 @@ void Runtime::application_affinity(int tid, const std::vector<int> &cpus) {
 
 void Runtime::handle_bpf_event(const affinitygraph_bpf_event &event) {
   if (event.kind == AFFINITYGRAPH_FUTEX || event.kind == AFFINITYGRAPH_VFS) {
-    if (thread_profile_ && !thread_profile_->dynamic.enabled &&
-        !thread_profile_->placements.empty()) return;
+    if (static_profile_effective()) return;
     std::lock_guard lock(mutex_);
     auto from = lifecycle_.find(static_cast<int>(event.tid));
     auto peer = lifecycle_.find(static_cast<int>(event.peer_tid));
@@ -488,14 +493,14 @@ void Runtime::handle_bpf_event(const affinitygraph_bpf_event &event) {
     observation.active_overlap = 1.0;
     const double aggregation_seconds = event.resource
         ? std::max(static_cast<double>(event.resource) / 1e9, 1e-6)
-        : static_cast<double>(config_.sample_interval_seconds);
+        : static_cast<double>(effective_sample_seconds_);
     if (event.kind == AFFINITYGRAPH_FUTEX)
       observation.futex_per_second =
           static_cast<double>(event.value_ns ? event.value_ns : 1) /
           aggregation_seconds;
     else
       observation.shared_vfs_seconds = static_cast<double>(event.value_ns) / 1e9 *
-          config_.sample_interval_seconds / aggregation_seconds;
+          effective_sample_seconds_ / aggregation_seconds;
     graph_.observe_relation(observation);
     return;
   }
@@ -594,7 +599,7 @@ void Runtime::consume_pending_bpf() {
     else handle_bpf_event(event);
   }
   const uint64_t minimum_duration_ns =
-      static_cast<uint64_t>(config_.sample_interval_seconds) * 1000000000ULL;
+      static_cast<uint64_t>(effective_sample_seconds_) * 1000000000ULL;
   relation_duration_ns = std::max(relation_duration_ns, minimum_duration_ns);
   const double aggregation_seconds =
       static_cast<double>(relation_duration_ns) / 1e9;
@@ -613,7 +618,7 @@ void Runtime::consume_pending_bpf() {
       weight = 0.7 * std::min(std::log1p(rate) / config_.sync_log_p95, 1.0);
     } else {
       const double seconds = static_cast<double>(value.value_ns) / 1e9 *
-          config_.sample_interval_seconds / aggregation_seconds;
+          effective_sample_seconds_ / aggregation_seconds;
       weight = 0.3 * std::min(std::log1p(seconds) / config_.share_log_p95, 1.0);
     }
     pair_weights[pair] += weight;
@@ -735,7 +740,9 @@ std::string Runtime::status_json() const {
   out << "{\"supervisor_pid\":" << supervisor_pid_ << ",\"root_pid\":" << root_pid_
       << ",\"target_tgids\":" << targets.str() << ",\"effective_mode\":\""
       << (config_.mode == Mode::Active ? "active" : config_.mode == Mode::Plan ? "plan" : "observe")
-      << "\",\"bpf\":" << (bpf_reader_ ? "true" : "false")
+      << "\",\"effective_dynamic\":" << (static_profile_effective() ? "false" : "true")
+      << ",\"sampling_stopped\":" << (sampling_stopped_ ? "true" : "false")
+      << ",\"bpf\":" << (bpf_reader_ ? "true" : "false")
       << ",\"bpf_health_valid\":" << (bpf_health_.valid ? "true" : "false")
       << ",\"bpf_health_error\":" << bpf_health_.error
       << ",\"bpf_emitted\":" << bpf_health_.counters.emitted
@@ -828,10 +835,14 @@ void Runtime::service_control_socket() {
   close(client);
 }
 
+bool Runtime::static_profile_effective() const {
+  return thread_profile_ && !thread_profile_->placements.empty() &&
+         (!config_.dynamic || !thread_profile_->dynamic.enabled);
+}
+
 void Runtime::reconcile_and_sample() {
   try {
-    const bool static_profile = thread_profile_ && !thread_profile_->dynamic.enabled &&
-                                !thread_profile_->placements.empty();
+    const bool static_profile = static_profile_effective();
     std::set<int> targets;
     {
       std::lock_guard lock(mutex_);
@@ -862,6 +873,7 @@ void Runtime::reconcile_and_sample() {
     std::set<int> seen;
     PlacementDelta profile_delta;
     std::set<int> profile_live;
+    int profile_new_matches = 0;
     {
       std::lock_guard lock(mutex_);
       target_tgids_ = std::move(existing_targets);
@@ -914,6 +926,7 @@ void Runtime::reconcile_and_sample() {
             } else {
               profile_delta.tid_to_mask[sample.identity.tid] = target;
               profile_live.insert(sample.identity.tid);
+              ++profile_new_matches;
               log("profile_match", "\"tid\":" + std::to_string(sample.identity.tid) +
                   ",\"starttime\":" + std::to_string(sample.identity.starttime) +
                   ",\"rule_id\":\"" + json_escape(assignment->rule_id) +
@@ -945,6 +958,16 @@ void Runtime::reconcile_and_sample() {
       } else {
         log("initial_affinity", "\"requested\":" + std::to_string(profile_delta.tid_to_mask.size()) +
             ",\"outcome\":\"" + (config_.mode == Mode::Plan ? "shadow" : "observed") + "\"");
+      }
+    }
+    if (config_.sample_interval_seconds == 0 && static_profile && !sampling_stopped_) {
+      if (profile_new_matches == 0) ++static_quiescent_windows_seen_;
+      else static_quiescent_windows_seen_ = 0;
+      if (static_quiescent_windows_seen_ >= config_.static_quiescent_windows) {
+        sampling_stopped_ = true;
+        log("sampling_stopped", "\"quiescent_windows\":" +
+            std::to_string(static_quiescent_windows_seen_) +
+            ",\"sample_interval_seconds\":0");
       }
     }
     collector_failed_since_ns_ = 0;
@@ -1368,8 +1391,7 @@ void Runtime::maybe_solve(uint64_t now) {
   // A static profile is an explicit placement experiment.  Its disabled
   // dynamic section prevents the legacy solver from changing the verified
   // initial masks during the measurement window.
-  if (thread_profile_ && !thread_profile_->dynamic.enabled &&
-      !thread_profile_->placements.empty()) {
+  if (static_profile_effective()) {
     log("solve_window_end", "\"window_id\":\"" + window_id +
         "\",\"complete\":true,\"outcome\":\"profile_static_hold\"");
     return;
@@ -1766,7 +1788,7 @@ void Runtime::run() {
   while (!stopping_) {
     service_control_socket();
     uint64_t now = monotonic_ns();
-    if (now >= next_sample) {
+    if (!sampling_stopped_ && now >= next_sample) {
       consume_pending_bpf();
       if (bpf_reader_) sample_bpf_health(now);
       reconcile_and_sample();
@@ -1777,7 +1799,7 @@ void Runtime::run() {
         next_heap_trim = now + 10000000000ULL;
       }
 #endif
-      next_sample = now + static_cast<uint64_t>(config_.sample_interval_seconds) * 1000000000ULL;
+      next_sample = now + static_cast<uint64_t>(effective_sample_seconds_) * 1000000000ULL;
     }
     usleep(50000);
   }

@@ -103,6 +103,7 @@ private:
   void run_bpf();
   void reconcile_and_sample();
   void maybe_solve(uint64_t now);
+  bool static_profile_effective() const;
   void solve_numa_domains(
       const std::string &window_id, const std::vector<ThreadDemand> &demands,
       const std::vector<RelationEdge> &edges,
@@ -117,6 +118,9 @@ private:
   void log(const std::string &type, const std::string &fields = "");
 
   Config config_;
+  int effective_sample_seconds_ = 1;
+  bool sampling_stopped_ = false;
+  int static_quiescent_windows_seen_ = 0;
   int root_pid_ = -1;
   int supervisor_pid_ = -1;
   bool collector_degraded_ = false;
