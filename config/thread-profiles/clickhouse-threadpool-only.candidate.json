@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profile_id": "clickhouse-threadpool-only-node2plus3",
+  "generated_at": "2026-08-19T00:00:00Z",
+  "status": "candidate",
+  "source": {"commit": "822897a", "experiment_id": "0008-threadpool_clickhouse_common_warm-c2t2-r3", "test_id": "c2t2-r3"},
+  "applicability": {"description": "ClickHouse C2T2 pure-read: only ThreadPool threads pinned to NUMA node2+3 (64-127); clickhouse/Common remain unrestricted. Ablation of the ThreadPool-only placement.", "similarity": {"metric": "", "threshold": null, "reported_gap": null}},
+  "dynamic": {"enabled": false, "small_step_threads": 1, "large_change_ratio": 0.3, "large_step_threads": 4, "cooldown_seconds": 10},
+  "placements": [
+    {"id": "clickhouse-threadpool-only-node2plus3", "match": {"comm": "ThreadPool", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127", "count": 38}]}
+  ]
+}
