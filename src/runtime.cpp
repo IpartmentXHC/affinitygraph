@@ -287,6 +287,9 @@ Runtime::Runtime(Config config, int root_pid, std::shared_ptr<BpfRingReader> bpf
   std::filesystem::create_directories(config_.log_directory);
   std::string path = config_.log_directory + "/runtime.jsonl";
   log_fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+  if (log_fd_ < 0)
+    throw std::runtime_error("cannot open runtime log " + path + ": " +
+                             std::strerror(errno));
   if (!config_.thread_profile_path.empty()) {
     try {
       thread_profile_ = load_thread_profile(config_.thread_profile_path, config_.cpus);
