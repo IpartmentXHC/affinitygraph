@@ -516,6 +516,53 @@ tests/manual-scenarios.sh --db clickhouse --dry-run
 脚本只负责启动与调度状态校验；**正式 YCSB 测量请在另一终端按第 3.5 节手动
 执行**。
 
+### 6.1 在新机器上生成 profile（换硬件）
+
+profile 的 `count` 只是放置上限（超出不放置），CPU 集合必须落在新机器资源
+信封内（越界 preflight 会拒绝）。线程数常随核数变化，换机器后需要重新观测。
+流程：新机器上用**方案一**（无 profile 动态调度）跑真实 workload，等 solver
+稳定放置后，用 `tests/export-profile.sh` 按旧 profile 的 comm 白名单聚合观测
+结果，生成静态新 profile。
+
+```sh
+# 1) 新机器：构建 + 校准 + 就绪检查（路径按实际替换）
+make all CXX=/usr/bin/clang++-18 CLANG=/usr/bin/clang-18
+sudo -A make calibrate
+sudo -A ./build/affinity-run preflight --config config/affinitygraph.toml \
+  --bpf-object build/affinitygraph.bpf.o
+
+# 2) 方案一启动 ClickHouse 并跑真实 workload（见第 3 节），等 solver 稳定放置
+#    确认有放置：affinityctl status 的 planned_assignments 非空
+
+# 3) 生成新 profile（--allowed-cpus 填新机器目标 node 的 CPU 集合）
+tests/export-profile.sh --db clickhouse \
+  --socket /tmp/affinitygraph-clickhouse-s1.sock \
+  --log /var/log/affinitygraph-clickhouse-s1/runtime.jsonl \
+  --template /etc/affinitygraph/profiles/clickhouse-threadpool-node2plus3.candidate.json \
+  --allowed-cpus 0-31 \
+  --output /etc/affinitygraph/profiles/clickhouse-newhost.candidate.json \
+  --profile-id clickhouse-newhost-r1
+# 脚本自动跑 preflight；期望 thread_profile: ok (N placement rule(s), static)
+
+# 4) 场景 2/3 复现：先 preflight 再启动（见第 4/5 节）
+sudo -A ./build/affinity-run preflight \
+  --config /etc/affinitygraph/targets/clickhouse-s3.toml \
+  --thread-profile /etc/affinitygraph/profiles/clickhouse-newhost.candidate.json \
+  --bpf-object build/affinitygraph.bpf.o
+```
+
+要点：
+
+- `--allowed-cpus` 必填，必须在新机器资源信封内（`lscpu -e=CPU,NODE` 确认）。
+- 脚本只聚合 `--template` 白名单内的 comm（线程组不变），
+  `affinities[].cpus` 与 `count` 取观测结果；白名单内未观测到的 comm 跳过并
+  告警（不生成空规则）；`planned_assignments` 为空时提示先等 solver 稳定。
+- 生成的 profile 为静态（`dynamic.enabled=false`）；需要动态微调时把顶层
+  `dynamic.enabled` 改为 `true` 再按场景 2 使用。
+- 运行用户：方案一与复现场景的 `--user` 按数据目录属主配置（
+  `CLICKHOUSE_RUN_USER`，默认 root），与脚本无关。
+
+
 ## 7. 日志速查
 
 ```sh
