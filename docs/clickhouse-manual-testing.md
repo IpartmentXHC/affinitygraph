@@ -1,20 +1,21 @@
 # ClickHouse 手动测试教程（不使用 YBA）
 
 面向**手动启动 ClickHouse + YCSB** 的压测场景：不用 YBA 编排，直接用
-`affinity-run` 监督 ClickHouse 进程，用 YCSB 打负载。覆盖三种场景：
+`affinity-run` 监督 ClickHouse 进程，用 YCSB 打负载。覆盖四个场景：
 
 | 场景 | profile | 调度方式 | 预期行为 |
 | --- | --- | --- | --- |
+| 0 | 无 | baseline | 不启动 affinitygraph，直接启动数据库测基线吞吐（对照） |
 | 1 | 无 | 动态 | runtime 自行采样、决策并迁移线程（`mode=active` 一步闭环） |
 | 2 | 有 | 动态 | profile 先做初始放置，solver 再在其上增量微调 |
 | 3 | 有 | 静态 | profile 放置后保持不动（`dynamic=false` + 可 `sample_interval_seconds=0` 停止采样） |
 
 文中命令以 183 上的默认路径为准（`/home/xhc/...`、`/etc/affinitygraph/...`）；
-换机器时替换成你的实际路径。三场景也可用 `tests/manual-scenarios.sh --db
-clickhouse` 自动跑（见第 5 节）。Doris 版教程见 `docs/doris-manual-testing.md`，
+换机器时替换成你的实际路径。四场景也可用 `tests/manual-scenarios.sh --db
+clickhouse` 自动跑（见第 6 节）。Doris 版教程见 `docs/doris-manual-testing.md`，
 两文结构相同，本章只强调 ClickHouse 差异。
 
-## 0. 前置准备（三种场景通用）
+## 0. 前置准备（四种场景通用）
 
 ```sh
 # 1) 构建（make all 已包含用户态程序 + BPF 对象 build/affinitygraph.bpf.o）
@@ -39,10 +40,10 @@ sudo -A ./build/affinity-run preflight --config config/affinitygraph.toml \
   preflight 报 `cpu_envelope: fail`。
 - **profile 路径优先级**：`--thread-profile` > `AFFINITY_THREAD_PROFILE` >
   TOML `runtime.thread_profile`。
-- **不要 `--user root`**：183 的 ClickHouse 数据目录
-  （`/home/xhc/clickhouse/...`）是 xhc 属主；以 root 运行 ClickHouse 会触发
-  权限拒绝（客户端报 Code: 430 / Cannot open file 之类）。直接用当前用户
-  （xhc）监督即可，不带 `--user`。
+- **默认以 `--user root` 监督**：`affinity-run --user root` 把 ClickHouse
+  降权为 root 运行。**ClickHouse 要求进程用户与数据目录属主一致**：数据为
+  root 属主时用默认（`CLICKHOUSE_RUN_USER=root`）；数据为 xhc 等非 root
+  属主时，设 `CLICKHOUSE_RUN_USER=xhc` 或置空，否则报 Code: 430。
 - **BPF 必须 ok**：`collector.required=true` 下 `bpf: fail` 会直接拒绝启动。
 
 ## 1. 拓扑与关键参数（183）
@@ -70,12 +71,38 @@ share_log_p95 = 0.00894730347830295
   `/tmp/affinitygraph-clickhouse-s{1,2,3}.sock`、
   `/var/log/affinitygraph-clickhouse-s{1,2,3}/runtime.jsonl`
 
-## 2. 场景 1：无 profile 文件的动态调度
+## 2. 场景 0：baseline（对照基线）
+
+不启动 affinitygraph，直接启动 ClickHouse，测量无干预的基线吞吐，作为
+场景 1/2/3 的对照（脚本 `tests/manual-scenarios.sh --db clickhouse` 默认
+包含该场景）。
+
+```sh
+# 直接启动 ClickHouse（等价于脚本场景 0 的命令；数据为 root 属主时用此命令）
+sudo -A nohup /home/xhc/clickhouse/ClickHouse/build/programs/clickhouse server \
+  --config-file /home/xhc/clickhouse/etc/config.xml \
+  > /tmp/affinity-clickhouse-baseline.log 2>&1 &
+
+# 等待 9004 端口就绪
+until timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9004' 2>/dev/null; do sleep 5; done
+
+# 然后执行 YCSB 测量（命令同 3.5 节），记录 baseline 吞吐
+
+# 结束：停掉 ClickHouse
+sudo -A pkill -x clickhouse; sudo -A pkill -x clckhouse-watch
+```
+
+- 运行用户：默认以 root 启动；若数据目录非 root 属主（如 183 的 xhc），脚本
+  会按 `CLICKHOUSE_RUN_USER`（如 `CLICKHOUSE_RUN_USER=xhc`）经
+  `runuser -u xhc` 启动，否则 ClickHouse 报 Code: 430。
+- baseline 没有 runtime.jsonl / affinityctl，就绪判定是 9004 端口可连。
+
+## 3. 场景 1：无 profile 文件的动态调度
 
 让 runtime 全自动：采样 → 构建关系证据 → solver 决策 → 迁移线程。适用于没有
 先验放置方案、想先看动态优化收益的场景。
 
-### 2.1 写测试配置
+### 3.1 写测试配置
 
 ```sh
 sudo -A mkdir -p /etc/affinitygraph/targets
@@ -117,7 +144,7 @@ EOF
 > `[calibration]` 使用冻结的 ClickHouse 实测尺度；换机器/负载时需重新
 > 校准，不要沿用。
 
-### 2.2 preflight 校验
+### 3.2 preflight 校验
 
 ```sh
 sudo -A ./build/affinity-run preflight \
@@ -126,7 +153,7 @@ sudo -A ./build/affinity-run preflight \
 # 期望 thread_profile 行不出现（无 profile）；其余 ok
 ```
 
-### 2.3 启动（后台运行）
+### 3.3 启动（后台运行）
 
 ```sh
 cd ~/affinitygraph
@@ -140,12 +167,14 @@ sudo -A nohup ./build/affinity-run run \
 
 要点：
 
-- 不带 `--user`：ClickHouse 保持 xhc 身份（root 会触发 Code: 430）。
+- 运行用户：默认 `--user root`（脚本用 `CLICKHOUSE_RUN_USER` 控制，默认
+  root）；若数据目录非 root 属主，设 `CLICKHOUSE_RUN_USER=xhc` 或置空，否则
+  ClickHouse 报 Code: 430。
 - `clickhouse server` 前台运行，`affinity-run` 一直监督；进程退出时 runtime
   执行 restore 并退出。
 - 也可在前台终端运行（去掉 `nohup ... &`），方便 Ctrl+C 收尾。
 
-### 2.4 验证调度闭环
+### 3.4 验证调度闭环
 
 ```sh
 # 等 ClickHouse 起来并完成至少一个决策窗口（约 60~90s）
@@ -172,7 +201,7 @@ sudo -A grep '"type":"solve_window_end"' /var/log/affinitygraph-clickhouse-s1/ru
 > `minimum_confidence` / `proposal_confirmations` 约束）。要看收益，给足
 > 时长（至少几个 `graph_horizon_seconds`）再压测。
 
-### 2.5 YCSB 测量（另一终端，197 客户端）
+### 3.5 YCSB 测量（另一终端，197 客户端）
 
 ```sh
 # 197 客户端；workloada_clickhouse_numa_read 为纯读，连接 183:9004
@@ -188,7 +217,7 @@ python2 bin/ycsb run jdbc -s \
 # 结果取 [OVERALL] Throughput(ops/sec)
 ```
 
-### 2.6 停止场景 1
+### 3.6 停止场景 1
 
 ```sh
 # 1) pause：同步恢复被迁移线程的掩码
@@ -205,12 +234,12 @@ sudo -A grep -E '"type":"(pause|runtime_stop)"' \
 sudo -A pkill -x clickhouse; sudo -A pkill -x clckhouse-watch
 ```
 
-## 3. 场景 2：有 profile 文件的动态调度
+## 4. 场景 2：有 profile 文件的动态调度
 
 先用已验证的放置画像做**初始放置**，再由 solver 在其上做**小范围动态微调**
 ——即“初始方案 + 增量调整”。
 
-### 3.1 准备动态 profile（复制 + 打开顶层 dynamic）
+### 4.1 准备动态 profile（复制 + 打开顶层 dynamic）
 
 ```sh
 # 参考 profile 顶层 dynamic.enabled=false（静态）
@@ -232,7 +261,7 @@ PY
 sudo -A grep -n '"enabled"' /etc/affinitygraph/profiles/clickhouse-s2.dynamic.json | head -1
 ```
 
-### 3.2 写测试配置
+### 4.2 写测试配置
 
 ```sh
 sudo -A tee /etc/affinitygraph/targets/clickhouse-s2.toml >/dev/null <<'EOF'
@@ -268,7 +297,7 @@ share_log_p95 = 0.00894730347830295
 EOF
 ```
 
-### 3.3 preflight 校验 profile
+### 4.3 preflight 校验 profile
 
 ```sh
 sudo -A ./build/affinity-run preflight \
@@ -278,7 +307,7 @@ sudo -A ./build/affinity-run preflight \
 # 期望 thread_profile: ok (3 placement rule(s), dynamic)
 ```
 
-### 3.4 启动
+### 4.4 启动
 
 ```sh
 cd ~/affinitygraph
@@ -291,7 +320,7 @@ sudo -A nohup ./build/affinity-run run \
   > /tmp/affinity-clickhouse-s2.log 2>&1 &
 ```
 
-### 3.5 验证：初始放置 + 动态微调
+### 4.5 验证：初始放置 + 动态微调
 
 ```sh
 # 等 ClickHouse 起来并完成初始放置 + 至少一个决策窗口
@@ -318,9 +347,9 @@ for k in ("effective_mode","target_tgids","threads","pinned_threads",
     print(f"{k}: {d.get(k)}")'
 ```
 
-### 3.6 YCSB 测量 + 停止
+### 4.6 YCSB 测量 + 停止
 
-同 2.5（socket/日志换成 `clickhouse-s2`），测量结束后：
+同 3.5（socket/日志换成 `clickhouse-s2`），测量结束后：
 
 ```sh
 sudo -A ./build/affinityctl pause --socket /tmp/affinitygraph-clickhouse-s2.sock
@@ -330,14 +359,14 @@ sudo -A grep -E '"type":"(pause|runtime_stop)"' \
 sudo -A pkill -x clickhouse; sudo -A pkill -x clckhouse-watch
 ```
 
-## 4. 场景 3：有 profile 文件的静态调度
+## 5. 场景 3：有 profile 文件的静态调度
 
 profile 放置后**保持不动**，跳过 solver。183 实测表明静态模式下可以
 `sample_interval_seconds=0`：持续采样到 profile 连续
 `static_quiescent_windows` 个窗口无新命中后彻底停止轮询（`sampling_stopped`），
 采样开销趋近于零。
 
-### 4.1 写测试配置（静态开关 + 零采样）
+### 5.1 写测试配置（静态开关 + 零采样）
 
 ```sh
 sudo -A tee /etc/affinitygraph/targets/clickhouse-s3.toml >/dev/null <<'EOF'
@@ -385,7 +414,7 @@ EOF
 > - 想保留低频轮询（新线程仍会被放置）可设 `sample_interval_seconds=30~60`
 >   并去掉 quiescent 逻辑。
 
-### 4.2 preflight
+### 5.2 preflight
 
 ```sh
 sudo -A ./build/affinity-run preflight \
@@ -395,7 +424,7 @@ sudo -A ./build/affinity-run preflight \
 # 期望 thread_profile: ok (3 placement rule(s), static)
 ```
 
-### 4.3 启动
+### 5.3 启动
 
 ```sh
 cd ~/affinitygraph
@@ -408,7 +437,7 @@ sudo -A nohup ./build/affinity-run run \
   > /tmp/affinity-clickhouse-s3.log 2>&1 &
 ```
 
-### 4.4 验证静态保持 + 采样停止
+### 5.4 验证静态保持 + 采样停止
 
 ```sh
 # 等初始放置完成并进入静态保持（ClickHouse 建议 2~3 分钟）
@@ -440,9 +469,9 @@ for k in ("effective_mode","bpf","collector_degraded","threads","pinned_threads"
 > `selector_ready` 不置位是设计行为。以 `initial_affinity success:true` +
 > 实际掩码 + `profile_static_hold` 为准。
 
-### 4.5 YCSB 测量 + 停止
+### 5.5 YCSB 测量 + 停止
 
-同 2.5（socket/日志换成 `clickhouse-s3`）。测量期间可观察日志确认无迁移
+同 3.5（socket/日志换成 `clickhouse-s3`）。测量期间可观察日志确认无迁移
 （`solve_window_end` 恒为 `profile_static_hold`）。结束：
 
 ```sh
@@ -453,17 +482,19 @@ sudo -A grep -E '"type":"(pause|runtime_stop)"' \
 sudo -A pkill -x clickhouse; sudo -A pkill -x clckhouse-watch
 ```
 
-## 5. 自动化脚本
+## 6. 自动化脚本
 
-`tests/manual-scenarios.sh` 自动完成三场景：按场景生成独立 toml、生成/选用
+`tests/manual-scenarios.sh` 自动完成四个场景（0=baseline，1-3=affinitygraph）：
+场景 0 直接启动数据库测基线；场景 1-3 按场景生成独立 toml、生成/选用
 profile、启动 affinity-run、轮询就绪标记、打印 status 校验、停止与清理。
 
 ```sh
-# 三场景全跑（交互：每个场景就绪后回车继续 / q 退出）
+# 四场景全跑（交互：每个场景就绪后回车继续 / q 退出）
 cd ~/affinitygraph
 tests/manual-scenarios.sh --db clickhouse
 
-# 只跑某个场景
+# 只跑某个场景（0=baseline，1=无 profile 动态，2=有 profile 动态，3=静态）
+tests/manual-scenarios.sh --db clickhouse --scenario 0
 tests/manual-scenarios.sh --db clickhouse --scenario 3
 
 # 无人值守：就绪后自动等待 60s 再进入下一场景
@@ -475,14 +506,17 @@ tests/manual-scenarios.sh --db clickhouse --dry-run
 
 脚本顶部 CONFIG 块是 183 默认值，可用同名环境变量覆盖：
 `CLICKHOUSE_BIN`、`CLICKHOUSE_CONFIG`、`CLICKHOUSE_PROFILE`、
-`CLICKHOUSE_CPUS`、`CLICKHOUSE_QUIESCENT_WINDOWS`、`TARGETS_DIR`、
+`CLICKHOUSE_CPUS`、`CLICKHOUSE_RUN_USER`（默认 root，设空则不带 `--user`；
+数据属主非 root 时设实际用户，如 `xhc`）、`CLICKHOUSE_READY_PORT`（默认
+9004，baseline 就绪判定端口）、`CLICKHOUSE_QUIESCENT_WINDOWS`、`TARGETS_DIR`、
 `PROFILES_DIR`、`CALIBRATION_DIR`、`SUDO_ASKPASS`、`READY_TIMEOUT_SECONDS`
-等。非 root 用户运行时自动经 `SUDO_ASKPASS + sudo -A` 提权。
+等。非 root 用户运行时自动经 `SUDO_ASKPASS + sudo -A` 提权；baseline 需以
+非 root 运行数据库时自动经 `runuser -u <user>` 启动。
 
-脚本只负责启动与调度状态校验；**正式 YCSB 测量请在另一终端按第 2.5 节手动
+脚本只负责启动与调度状态校验；**正式 YCSB 测量请在另一终端按第 3.5 节手动
 执行**。
 
-## 6. 日志速查
+## 7. 日志速查
 
 ```sh
 # runtime 全量事件
@@ -496,11 +530,11 @@ sudo -A grep -E '"type":"(solve_window_end|action|action_commit|sampling_stopped
 sudo -A tail -30 /tmp/affinity-clickhouse-sN.log
 ```
 
-## 7. FAQ
+## 8. FAQ
 
-- **为什么不能 `--user root`？** 183 的 ClickHouse 数据目录是 xhc 属主，root
-  启动会被 ClickHouse 自身拒绝（客户端报 Code: 430 一类权限错误）；保持
-  默认（不带 `--user`）即可。
+- **`--user root` 与数据属主？** ClickHouse 要求进程用户与数据目录属主一致。
+  数据为 root 属主时默认 `--user root` 正确；数据为 xhc 等非 root 属主时，
+  设 `CLICKHOUSE_RUN_USER=xhc` 或置空，否则 ClickHouse 报 Code: 430。
 - **`active_effective=false` 是不是没生效？** 静态场景（场景 3）这是设计行为；
   动态场景（1/2）它应为 true，若为 false 检查 `solver_phase`、`pinned_threads`、
   决策窗口日志。

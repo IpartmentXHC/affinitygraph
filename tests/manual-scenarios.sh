@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# 三场景手动测试自动化脚本（Doris / ClickHouse）
+# 四场景手动测试自动化脚本（Doris / ClickHouse）
 #
 # 用法:
-#   tests/manual-scenarios.sh --db doris|clickhouse [--scenario 1|2|3] [--dry-run]
+#   tests/manual-scenarios.sh --db doris|clickhouse [--scenario 0|1|2|3] [--dry-run]
 #
-# 三个场景:
-#   1) 无 profile 文件的动态调度   (mode=active, solver 自行决策)
-#   2) 有 profile 文件的动态调度   (profile 初始放置 + solver 增量微调)
-#   3) 有 profile 文件的静态调度   (profile 放置后保持, dynamic=false, 可选零采样)
+# 四个场景:
+#   0) baseline                  无 affinitygraph 干预, 直接启动数据库测基线吞吐
+#   1) 无 profile 文件的动态调度  mode=active, solver 自行决策
+#   2) 有 profile 文件的动态调度  profile 初始放置 + solver 增量微调
+#   3) 有 profile 文件的静态调度  profile 放置后保持, dynamic=false, 可选零采样
 #
 # 交互: 每个场景启动并校验就绪后, 提示按回车停止当前场景并进入下一场景,
 #       输入 q 退出。设置 AUTO_NEXT_SECONDS>0 可无人值守自动推进。
@@ -31,22 +32,26 @@ CALIBRATION_DIR=${CALIBRATION_DIR:-/etc/affinitygraph/calibration}
 # 非 root 时的提权方式（183 的 askpass 脚本）
 SUDO_ASKPASS=${SUDO_ASKPASS:-/home/xhc/ExperScript/doris-bench/askpass.sh}
 
-# ---- Doris（183：数据为 root 属主，必须 --user root） ----
+# ---- Doris（数据目录可能是 root 属主 → 默认 --user root，可设 DORIS_RUN_USER="" 取消） ----
 DORIS_HOME=${DORIS_HOME:-/home/xhc/doris/apache-doris-2.1.2-bin-arm64}
 DORIS_FE_START=${DORIS_FE_START:-$DORIS_HOME/fe/bin/start_fe.sh}
 DORIS_BE_START=${DORIS_BE_START:-$DORIS_HOME/be/bin/start_be.sh}
 DORIS_PROFILE=${DORIS_PROFILE:-$PROFILES_DIR/doris-node2-dynamic.candidate.json}
 DORIS_CPUS=${DORIS_CPUS:-64-95}
+DORIS_RUN_USER=${DORIS_RUN_USER-root}
+DORIS_READY_PORT=${DORIS_READY_PORT:-9030}
 DORIS_QUIESCENT_WINDOWS=${DORIS_QUIESCENT_WINDOWS:-180}
 
-# ---- ClickHouse（183：数据为 xhc 属主，禁止 --user root，否则 Code 430） ----
+# ---- ClickHouse（数据目录可能是 root 属主 → 默认 --user root，可设 CLICKHOUSE_RUN_USER="" 取消） ----
 CLICKHOUSE_BIN=${CLICKHOUSE_BIN:-/home/xhc/clickhouse/ClickHouse/build/programs/clickhouse}
 CLICKHOUSE_CONFIG=${CLICKHOUSE_CONFIG:-/home/xhc/clickhouse/etc/config.xml}
 CLICKHOUSE_PROFILE=${CLICKHOUSE_PROFILE:-$PROFILES_DIR/clickhouse-threadpool-node2plus3.candidate.json}
 CLICKHOUSE_CPUS=${CLICKHOUSE_CPUS:-64-127}
+CLICKHOUSE_RUN_USER=${CLICKHOUSE_RUN_USER-root}
+CLICKHOUSE_READY_PORT=${CLICKHOUSE_READY_PORT:-9004}
 CLICKHOUSE_QUIESCENT_WINDOWS=${CLICKHOUSE_QUIESCENT_WINDOWS:-60}
 
-READY_TIMEOUT_SECONDS=${READY_TIMEOUT_SECONDS:-300}   # 等待调度就绪的最长秒数
+READY_TIMEOUT_SECONDS=${READY_TIMEOUT_SECONDS:-300}   # 等待就绪的最长秒数
 AUTO_NEXT_SECONDS=${AUTO_NEXT_SECONDS:-0}             # >0 时就绪后自动推进
 SAMPLE_ZERO_STATIC=${SAMPLE_ZERO_STATIC:-1}           # 场景3 使用 sample_interval_seconds=0
 
@@ -84,25 +89,31 @@ warn() { printf '[WARN] %s\n' "$*"; }
 die()  { printf '[FAIL] %s\n' "$*" >&2; exit 2; }
 
 usage() {
-  sed -n '2,14p' "$0"
+  sed -n '2,18p' "$0"
   exit 0
 }
 
 # ============ 场景参数 ============
-# 按 db+场景 返回: LOG_DIR SOCKET TOML PROFILE RUN_USER CMD...
+# 按 db+场景 返回: LOG_DIR SOCKET TOML RUN_USER CMD BASELINE_CMD READY_PORT
 db_config() { # $1=db $2=scenario
   case "$1" in
     doris)
       LOG_PREFIX="/var/log/affinitygraph-doris-s${2}"
       SOCKET="/tmp/affinitygraph-doris-s${2}.sock"
-      RUN_USER=(--user root)
+      RUN_USER=(--user "$DORIS_RUN_USER")
+      [ -z "$DORIS_RUN_USER" ] && RUN_USER=()
       CMD=(bash -c "$DORIS_FE_START --daemon && $DORIS_BE_START --daemon && wait")
+      BASELINE_CMD=(bash -c "$DORIS_FE_START --daemon && $DORIS_BE_START --daemon")
+      READY_PORT="$DORIS_READY_PORT"
       ;;
     clickhouse)
       LOG_PREFIX="/var/log/affinitygraph-clickhouse-s${2}"
       SOCKET="/tmp/affinitygraph-clickhouse-s${2}.sock"
-      RUN_USER=()
+      RUN_USER=(--user "$CLICKHOUSE_RUN_USER")
+      [ -z "$CLICKHOUSE_RUN_USER" ] && RUN_USER=()
       CMD=("$CLICKHOUSE_BIN" server --config-file "$CLICKHOUSE_CONFIG")
+      BASELINE_CMD=("$CLICKHOUSE_BIN" server --config-file "$CLICKHOUSE_CONFIG")
+      READY_PORT="$CLICKHOUSE_READY_PORT"
       ;;
   esac
   TOML="$TARGETS_DIR/${1}-s${2}.toml"
@@ -221,6 +232,10 @@ cleanup_leftovers() { # $1=db
   sleep 3
 }
 
+port_ready() { # $1=port; bash /dev/tcp 探测，避免依赖 nc
+  timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null
+}
+
 launch_scenario() { # $1=db $2=scenario $3=profile
   local db=$1 n=$2 profile=$3
   db_config "$db" "$n"
@@ -250,6 +265,25 @@ launch_scenario() { # $1=db $2=scenario $3=profile
   info "supervisor pid=$SUPERVISOR_PID socket=$SOCKET"
 }
 
+launch_baseline() { # $1=db
+  local db=$1
+  db_config "$db" 0
+  local log="/tmp/affinity-${db}-baseline.log"
+  info "启动 baseline（$db，无 affinitygraph 干预）..."
+  run_as_root rm -f "$log"
+  cleanup_leftovers "$db"
+  info "启动命令: ${BASELINE_CMD[*]}"
+  if [ ${#RUN_USER[@]} -gt 0 ] && [ "${RUN_USER[1]}" != root ]; then
+    # 数据目录属主非 root 时，以指定用户启动 DB（如 ClickHouse 要求与数据属主一致）
+    info "以用户 ${RUN_USER[1]} 启动数据库（数据目录属主非 root 时必需）"
+    as_root nohup runuser -u "${RUN_USER[1]}" -- "${BASELINE_CMD[@]}" > "$log" 2>&1 &
+  else
+    as_root nohup "${BASELINE_CMD[@]}" > "$log" 2>&1 &
+  fi
+  sleep 3
+  info "数据库进程已拉起，等待端口 $READY_PORT 就绪"
+}
+
 check_marker() { # $1=db $2=scenario $3=marker
   local db=$1 n=$2 m=$3
   local log="${LOG_PREFIX}/runtime.jsonl"
@@ -262,12 +296,14 @@ check_marker() { # $1=db $2=scenario $3=marker
     solve_window_end_any)       printf '%s' "$data" | grep -c '"type":"solve_window_end"' | grep -qv '^0$' ;;
     profile_static_hold)        printf '%s' "$data" | grep '"type":"solve_window_end"' | tail -1 | grep -q '"outcome":"profile_static_hold"' ;;
     sampling_stopped)           printf '%s' "$data" | grep -q '"type":"sampling_stopped"' ;;
+    db_port_ready)              port_ready "$READY_PORT" ;;
     *) return 1 ;;
   esac
 }
 
 required_markers() { # $1=scenario
   case "$1" in
+    0) echo "db_port_ready" ;;
     1) echo "runtime_start solve_window_end_any" ;;
     2) echo "profile_load_success initial_affinity_committed solve_window_end_any" ;;
     3) echo "profile_load_success initial_affinity_committed profile_static_hold sampling_stopped" ;;
@@ -332,6 +368,29 @@ for k in ["effective_mode","effective_dynamic","sampling_stopped","bpf","collect
   fi
 }
 
+verify_baseline() { # $1=db
+  local db=$1
+  info "===== 场景 0 状态校验（baseline, $db） ====="
+  for m in $(required_markers 0); do
+    if check_marker "$db" 0 "$m"; then printf '  [ok] %s\n' "$m"; else printf '  [!!] %s 缺失\n' "$m"; fi
+  done
+  info "数据库进程:"
+  case "$db" in
+    doris)
+      as_root sh -c "pgrep -a -x java 2>/dev/null | head -3; pgrep -a -x doris_be 2>/dev/null | head -3" || true
+      ;;
+    clickhouse)
+      as_root sh -c "pgrep -a -x clickhouse 2>/dev/null | head -3" || true
+      ;;
+  esac
+  if port_ready "$READY_PORT"; then
+    info "  [ok] 端口 $READY_PORT 可连，YCSB 可开始测量 baseline"
+  else
+    warn "  端口 $READY_PORT 未就绪"
+  fi
+  info "说明: 当前无 affinitygraph 干预；在此状态执行 YCSB 获取 baseline 吞吐"
+}
+
 stop_scenario() { # $1=db $2=scenario
   local db=$1 n=$2
   local log="${LOG_PREFIX}/runtime.jsonl"
@@ -349,6 +408,29 @@ stop_scenario() { # $1=db $2=scenario
   info "  runtime 收尾事件:"
   as_root sh -c "grep -E '\"type\":\"(pause|runtime_stop)\"' '$log' 2>/dev/null | tail -2" || true
   cleanup_leftovers "$db"
+}
+
+stop_baseline() { # $1=db
+  info "停止 baseline（$1）..."
+  cleanup_leftovers "$1"
+}
+
+user_advance() { # 交互/无人值守推进; 返回 0=继续 1=退出
+  if [ "$AUTO_NEXT_SECONDS" -gt 0 ]; then
+    info "AUTO_NEXT_SECONDS=${AUTO_NEXT_SECONDS}s 后自动进入下一场景"
+    sleep "$AUTO_NEXT_SECONDS"
+    return 0
+  fi
+  local ans=""
+  while true; do
+    printf '[交互] 在另一终端手动执行 YCSB 测量。按回车停止当前场景并继续；输入 q 退出: '
+    IFS= read -r ans || ans=q
+    case "$ans" in
+      ""|q|Q) break ;;
+      *) printf '  仅接受回车（继续）或 q（退出）\n' ;;
+    esac
+  done
+  case "$ans" in q|Q) return 1 ;; *) return 0 ;; esac
 }
 
 # ============ 主流程 ============
@@ -369,15 +451,40 @@ case "$DB" in
 esac
 
 if [ -n "$SCENARIO" ]; then
-  case "$SCENARIO" in 1|2|3) ;; *) die "--scenario 仅支持 1|2|3" ;; esac
+  case "$SCENARIO" in 0|1|2|3) ;; *) die "--scenario 仅支持 0|1|2|3" ;; esac
   SCENARIOS=$SCENARIO
 else
-  SCENARIOS="1 2 3"
+  SCENARIOS="0 1 2 3"
 fi
 
 info "数据库: $DB  场景: $SCENARIOS  dry-run=$DRY_RUN"
 for n in $SCENARIOS; do
-  info "######## 场景 $n / 3 ########"
+  if [ "$n" = 0 ]; then
+    info "######## 场景 0（baseline，无 affinitygraph 干预）########"
+    if [ "$DRY_RUN" = 1 ]; then
+      db_config "$DB" 0
+      info "baseline：不启动 affinitygraph，直接启动数据库（用于测量基线吞吐）"
+      info "启动命令: ${BASELINE_CMD[*]}"
+      if [ ${#RUN_USER[@]} -gt 0 ] && [ "${RUN_USER[1]}" != root ]; then
+        printf '  + [sudo] nohup runuser -u %s -- %s > /tmp/affinity-%s-baseline.log 2>&1 &\n' "${RUN_USER[1]}" "${BASELINE_CMD[*]}" "$DB"
+      else
+        printf '  + [sudo] nohup %s > /tmp/affinity-%s-baseline.log 2>&1 &\n' "${BASELINE_CMD[*]}" "$DB"
+      fi
+      info "dry-run：跳过就绪等待/校验/交互"
+      continue
+    fi
+    launch_baseline "$DB"
+    wait_ready "$DB" 0 || true
+    verify_baseline "$DB"
+    if ! user_advance; then
+      info "用户选择退出，清理后结束"
+      stop_baseline "$DB"
+      exit 0
+    fi
+    stop_baseline "$DB"
+    continue
+  fi
+  info "######## 场景 $n ########"
   write_toml "$DB" "$n"
   PROFILE=$(ensure_profile "$DB" "$n")
   if [ -n "$PROFILE" ]; then info "使用 profile: $PROFILE"; fi
@@ -389,24 +496,10 @@ for n in $SCENARIOS; do
   fi
   wait_ready "$DB" "$n" || true
   verify_scenario "$DB" "$n"
-  if [ "$AUTO_NEXT_SECONDS" -gt 0 ]; then
-    info "AUTO_NEXT_SECONDS=${AUTO_NEXT_SECONDS}s 后自动进入下一场景"
-    sleep "$AUTO_NEXT_SECONDS"
-  else
-    ans=""
-    while true; do
-      printf '[交互] 在另一终端手动执行 YCSB 测量。按回车停止当前场景并继续；输入 q 退出: '
-      IFS= read -r ans || ans=q
-      case "$ans" in
-        ""|q|Q) break ;;
-        *) printf '  仅接受回车（继续）或 q（退出）\n' ;;
-      esac
-    done
-    if [ "$ans" = q ] || [ "$ans" = Q ]; then
-      info "用户选择退出，清理后结束"
-      stop_scenario "$DB" "$n"
-      exit 0
-    fi
+  if ! user_advance; then
+    info "用户选择退出，清理后结束"
+    stop_scenario "$DB" "$n"
+    exit 0
   fi
   stop_scenario "$DB" "$n"
 done
