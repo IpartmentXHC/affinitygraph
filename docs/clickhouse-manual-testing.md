@@ -516,6 +516,9 @@ tests/manual-scenarios.sh --db clickhouse --dry-run
 脚本只负责启动与调度状态校验；**正式 YCSB 测量请在另一终端按第 3.5 节手动
 执行**。
 
+另有 `tests/export-profile.sh` 用于在新机器上由方案一观测生成
+profile（见 6.1）。
+
 ### 6.1 在新机器上生成 profile（换硬件）
 
 profile 的 `count` 只是放置上限（超出不放置），CPU 集合必须落在新机器资源
