@@ -746,6 +746,7 @@ std::string Runtime::status_json() const {
       << (config_.mode == Mode::Active ? "active" : config_.mode == Mode::Plan ? "plan" : "observe")
       << "\",\"effective_dynamic\":" << (static_profile_effective() ? "false" : "true")
       << ",\"sampling_stopped\":" << (sampling_stopped_ ? "true" : "false")
+      << ",\"static_scan_seconds\":" << config_.static_scan_seconds
       << ",\"bpf\":" << (bpf_reader_ ? "true" : "false")
       << ",\"bpf_health_valid\":" << (bpf_health_.valid ? "true" : "false")
       << ",\"bpf_health_error\":" << bpf_health_.error
@@ -972,7 +973,8 @@ void Runtime::reconcile_and_sample() {
         sampling_stopped_ = true;
         log("sampling_stopped", "\"quiescence_seconds\":" +
             std::to_string(config_.static_quiescence_seconds) +
-            ",\"sample_interval_seconds\":0");
+            ",\"sample_interval_seconds\":0,\"rescan_seconds\":" +
+            std::to_string(config_.static_scan_seconds));
       }
     }
     collector_failed_since_ns_ = 0;
@@ -1793,7 +1795,10 @@ void Runtime::run() {
   while (!stopping_) {
     service_control_socket();
     uint64_t now = monotonic_ns();
-    if (!sampling_stopped_ && now >= next_sample) {
+    // 静态零采样模式下，绑定完成后默认降为低频续扫（static_scan_seconds>0），
+    // 运行期新建的匹配线程仍会被自动绑定；static_scan_seconds=0 则彻底停止。
+    const bool scanning = !sampling_stopped_ || config_.static_scan_seconds > 0;
+    if (scanning && now >= next_sample) {
       consume_pending_bpf();
       if (bpf_reader_) sample_bpf_health(now);
       reconcile_and_sample();
@@ -1804,7 +1809,11 @@ void Runtime::run() {
         next_heap_trim = now + 10000000000ULL;
       }
 #endif
-      next_sample = now + static_cast<uint64_t>(effective_sample_seconds_) * 1000000000ULL;
+      const uint64_t interval_ns =
+          sampling_stopped_
+              ? static_cast<uint64_t>(config_.static_scan_seconds) * 1000000000ULL
+              : static_cast<uint64_t>(effective_sample_seconds_) * 1000000000ULL;
+      next_sample = now + interval_ns;
     }
     usleep(50000);
   }

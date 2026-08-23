@@ -20,6 +20,7 @@ struct Config {
   Mode mode = Mode::Observe;
   bool dynamic = true;
   int static_quiescence_seconds = 30;
+  int static_scan_seconds = 30;
   std::vector<int> cpus;
   std::string calibration_path;
   std::string log_directory = "/tmp/affinitygraph";

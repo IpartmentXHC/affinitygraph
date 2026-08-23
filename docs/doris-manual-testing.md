@@ -353,9 +353,11 @@ sudo -A pkill -x java; sudo -A pkill -x doris_be
 
 profile 放置后**保持不动**，跳过 solver。静态模式（`sample_interval_seconds=0`）
 按线程组名扫描：每发现一个匹配线程就绑定到目标 node；连续
-`static_quiescence_seconds`（默认 30）秒无新匹配线程即判定绑定完成并停止轮询
-（`sampling_stopped`），采样开销趋近于零。profile 不含 `count`，不依赖具体
-线程数（数据库按硬件自动调整线程数也能覆盖）。
+`static_quiescence_seconds`（默认 30）秒无新匹配线程即判定初始绑定完成
+（`sampling_stopped`），随后进入**低频续扫**（`static_scan_seconds`，默认每
+30 秒一次），运行期新建的匹配线程仍会被自动绑定；设 `static_scan_seconds=0`
+可彻底停止扫描。profile 不含 `count`，不依赖具体线程数（数据库按硬件自动
+调整线程数也能覆盖）。
 
 ### 5.1 写测试配置（静态开关 + 零采样）
 
@@ -366,6 +368,7 @@ mode = "active"
 dynamic = false
 sample_interval_seconds = 0
 static_quiescence_seconds = 30
+static_scan_seconds = 30
 graph_horizon_seconds = 60
 solve_interval_seconds = 10
 minimum_confidence = 0.8
@@ -400,9 +403,10 @@ EOF
 >   `dynamic.enabled` 决定。
 > - `sample_interval_seconds=0` **仅静态模式合法**（动态模式会
 >   `sampling: fail`）；`static_quiescence_seconds=30` 表示 30 秒内没有新的
->   匹配线程出现就判定绑定完成并停采样。线程池慢启动的库可调大（如 60）。
-> - 绑定完成后采样停止，之后新建的匹配线程**不再自动绑定**；如工作负载
->   运行期会创建新线程，请改用场景 2（动态）或设 `sample_interval_seconds>0`。
+>   匹配线程出现就判定初始绑定完成。线程池慢启动的库可调大（如 60）。
+> - 绑定完成后默认**低频续扫**：`static_scan_seconds=30` 表示每 30 秒扫一次，
+>   运行期新建的匹配线程（如 ClickHouse 按需扩的 `ThreadPool`）会被自动绑定；
+>   想回到彻底停止（零开销）就设 `static_scan_seconds=0`。
 
 ### 5.2 preflight
 
@@ -500,7 +504,7 @@ tests/manual-scenarios.sh --db doris --dry-run
 `DORIS_HOME`、`DORIS_FE_START`、`DORIS_BE_START`、`DORIS_PROFILE`、
 `DORIS_CPUS`、`DORIS_RUN_USER`（默认 root，设空则不带 `--user`）、
 `DORIS_READY_PORT`（默认 9030，baseline 就绪判定端口）、
-`DORIS_QUIESCENCE_SECONDS`（默认 30）、`TARGETS_DIR`、`PROFILES_DIR`、`CALIBRATION_DIR`、
+`DORIS_QUIESCENCE_SECONDS`（默认 30）、`DORIS_STATIC_SCAN_SECONDS`（默认 30）、`TARGETS_DIR`、`PROFILES_DIR`、`CALIBRATION_DIR`、
 `SUDO_ASKPASS`、`READY_TIMEOUT_SECONDS` 等。
 非 root 用户运行时自动经 `SUDO_ASKPASS + sudo -A` 提权；baseline 需以非 root
 运行数据库时自动经 `runuser -u <user>` 启动。
@@ -535,7 +539,8 @@ sudo -A ./build/affinity-run preflight \
 要点：
 
 - 运行时按线程组名扫描，每发现一个匹配线程就绑定到目标 CPU 集合；30 秒
-  （`static_quiescence_seconds`）无新匹配线程即判定绑定完成并停止扫描，
+  （`static_quiescence_seconds`）无新匹配线程即判定初始绑定完成，之后低频
+  续扫（`static_scan_seconds`，默认每 30 秒一次）继续绑定运行期新建线程，
   所以无需知道/配置线程数。
 - 生成的 profile 为静态（`dynamic.enabled=false`）；需要动态微调时把顶层
   `dynamic.enabled` 改为 `true` 再按场景 2 使用。
@@ -565,10 +570,9 @@ sudo -A tail -30 /tmp/affinity-doris-sN.log
 - **`active_effective=false` 是不是没生效？** 静态场景（场景 3）这是设计行为；
   动态场景（1/2）它应为 true，若为 false 检查 `solver_phase`、`pinned_threads`、
   决策窗口日志。
-- **`sampling_stopped` 后还能放置新线程吗？** 不能，采样已停；绑定完成后
-  新建的匹配线程不再自动绑定。如工作负载运行期会创建新线程，请调大
-  `static_quiescence_seconds`、改用场景 2（动态），或设
-  `sample_interval_seconds>0`。
+- **`sampling_stopped` 后还能放置新线程吗？** 默认可以：绑定完成后进入低频
+  续扫（`static_scan_seconds`，默认每 30 秒一次），运行期新建的匹配线程会被
+  自动绑定；设 `static_scan_seconds=0` 才彻底停止。
 - **为什么场景 1 迁移很少？** solver 需要跨窗口积累证据，且受
   `minimum_confidence`/`proposal_confirmations`/`maximum_migrated_threads_ratio`
   约束；给足时长（≥ 数个 `graph_horizon_seconds`）再测量。

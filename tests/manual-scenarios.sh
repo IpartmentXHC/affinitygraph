@@ -41,6 +41,7 @@ DORIS_CPUS=${DORIS_CPUS:-64-95}
 DORIS_RUN_USER=${DORIS_RUN_USER-root}
 DORIS_READY_PORT=${DORIS_READY_PORT:-9030}
 DORIS_QUIESCENCE_SECONDS=${DORIS_QUIESCENCE_SECONDS:-30}
+DORIS_STATIC_SCAN_SECONDS=${DORIS_STATIC_SCAN_SECONDS:-30}
 
 # ---- ClickHouse（数据目录可能是 root 属主 → 默认 --user root，可设 CLICKHOUSE_RUN_USER="" 取消） ----
 CLICKHOUSE_BIN=${CLICKHOUSE_BIN:-/home/xhc/clickhouse/ClickHouse/build/programs/clickhouse}
@@ -50,6 +51,7 @@ CLICKHOUSE_CPUS=${CLICKHOUSE_CPUS:-64-127}
 CLICKHOUSE_RUN_USER=${CLICKHOUSE_RUN_USER-root}
 CLICKHOUSE_READY_PORT=${CLICKHOUSE_READY_PORT:-9004}
 CLICKHOUSE_QUIESCENCE_SECONDS=${CLICKHOUSE_QUIESCENCE_SECONDS:-30}
+CLICKHOUSE_STATIC_SCAN_SECONDS=${CLICKHOUSE_STATIC_SCAN_SECONDS:-30}
 
 READY_TIMEOUT_SECONDS=${READY_TIMEOUT_SECONDS:-300}   # 等待就绪的最长秒数
 AUTO_NEXT_SECONDS=${AUTO_NEXT_SECONDS:-0}             # >0 时就绪后自动推进
@@ -146,8 +148,9 @@ EOF
 write_toml() { # $1=db $2=scenario
   local db=$1 n=$2
   db_config "$db" "$n"
-  local qs=1
+  local qs=1 scan=0
   [ "$n" = 3 ] && qs=$([ "$db" = doris ] && echo "$DORIS_QUIESCENCE_SECONDS" || echo "$CLICKHOUSE_QUIESCENCE_SECONDS")
+  [ "$n" = 3 ] && scan=$([ "$db" = doris ] && echo "$DORIS_STATIC_SCAN_SECONDS" || echo "$CLICKHOUSE_STATIC_SCAN_SECONDS")
   if [ "$DRY_RUN" = 1 ]; then
     info "将生成配置 $TOML"
     return 0
@@ -159,6 +162,7 @@ mode = "active"
 sample_interval_seconds = $([ "$n" = 3 ] && [ "$SAMPLE_ZERO_STATIC" = 1 ] && echo 0 || echo 1)
 $([ "$n" = 3 ] && printf 'dynamic = false\n')
 $([ "$n" = 3 ] && printf 'static_quiescence_seconds = %s\n' "$qs")
+$([ "$n" = 3 ] && printf 'static_scan_seconds = %s\n' "$scan")
 graph_horizon_seconds = 60
 solve_interval_seconds = 10
 minimum_confidence = 0.8

@@ -122,6 +122,7 @@ Config load_config(const std::string &path, const std::string &cpu_override) {
     else if (key == "runtime.static_quiescence_seconds") c.static_quiescence_seconds = std::stoi(value);
     else if (key == "runtime.static_quiescent_windows")
       c.static_quiescence_seconds = std::stoi(value); // deprecated alias
+    else if (key == "runtime.static_scan_seconds") c.static_scan_seconds = std::stoi(value);
     else if (key == "runtime.sample_interval_seconds") c.sample_interval_seconds = std::stoi(value);
     else if (key == "runtime.graph_horizon_seconds") c.graph_horizon_seconds = std::stoi(value);
     else if (key == "runtime.solve_interval_seconds") c.solve_interval_seconds = std::stoi(value);
@@ -207,6 +208,7 @@ Config load_config(const std::string &path, const std::string &cpu_override) {
   if (c.sample_interval_seconds < 0 || c.graph_horizon_seconds < c.sample_interval_seconds ||
       c.solve_interval_seconds < c.sample_interval_seconds || c.minimum_confidence < 0 ||
       c.minimum_confidence > 1 || c.static_quiescence_seconds < 1 ||
+      c.static_scan_seconds < 0 ||
       c.proposal_confirmations < 1 ||
       c.initial_proposal_confirmations < 1 ||
       c.minimum_dwell_seconds < 0 || c.maximum_migrated_threads_ratio < 0 ||

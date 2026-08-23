@@ -3,6 +3,7 @@ mode = "active"
 dynamic = false
 sample_interval_seconds = 0
 static_quiescence_seconds = 30
+static_scan_seconds = 15
 graph_horizon_seconds = 2
 solve_interval_seconds = 1
 minimum_confidence = 0.0

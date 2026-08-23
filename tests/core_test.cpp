@@ -64,7 +64,8 @@ void test_cpu_lists() {
           "per-thread configuration parsed");
   auto static_config = load_config("tests/fixtures/config-static-sample0.toml");
   require(!static_config.dynamic && static_config.sample_interval_seconds == 0 &&
-              static_config.static_quiescence_seconds == 30,
+              static_config.static_quiescence_seconds == 30 &&
+              static_config.static_scan_seconds == 15,
           "static sample-zero configuration parsed");
   bool invalid_rejected = false;
   try {

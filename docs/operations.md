@@ -64,8 +64,10 @@ counts are not assumed, so databases that size thread pools by hardware are
 covered). A profile with `dynamic.enabled = false` is a static-hold
 experiment: the runtime binds each matching thread as it is discovered and,
 after `runtime.static_quiescence_seconds` (default 30) without a new match,
-stops sampling (`sampling_stopped`) and holds the masks for the measurement
-window, skipping graph/solver activity. On exit the runtime exports a
+marks initial binding complete (`sampling_stopped`) and keeps scanning at a
+low frequency (`runtime.static_scan_seconds`, default 30; 0 = fully stop) so
+threads created during the run are still bound; it holds the masks for the
+measurement window, skipping graph/solver activity. On exit the runtime exports a
 `candidate` profile (status and `generated_at` refreshed) to
 `runtime.profile_output`, or to
 `<log_directory>/profiles/thread-profile-candidate.json` by default.
