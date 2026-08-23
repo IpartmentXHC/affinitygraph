@@ -86,11 +86,11 @@ void validate_rule(const ThreadProfileRule &rule, const std::vector<int> &envelo
     throw std::runtime_error("profile rule has invalid match fields: " + rule.id);
   if (!subset(rule.allowed_cpus, envelope))
     throw std::runtime_error("profile allowed_cpus outside resource envelope: " + rule.id);
-  for (const auto &affinity : rule.affinities) {
-    if (affinity.count == 0 || affinity.cpus.empty() ||
-        !subset(affinity.cpus, rule.allowed_cpus))
-      throw std::runtime_error("profile affinity is invalid: " + rule.id);
-  }
+  if (rule.affinities.size() != 1)
+    throw std::runtime_error("profile rule must have exactly one affinity: " + rule.id);
+  const auto &affinity = rule.affinities[0];
+  if (affinity.cpus.empty() || !subset(affinity.cpus, rule.allowed_cpus))
+    throw std::runtime_error("profile affinity is invalid: " + rule.id);
 }
 
 std::string esc(const std::string &value) {
@@ -128,7 +128,7 @@ ThreadProfile load_thread_profile(const std::string &path,
   profile.dynamic.large_change_ratio = number_field<double>(dynamic, "large_change_ratio");
   profile.dynamic.large_step_threads = number_field<int>(dynamic, "large_step_threads");
   profile.dynamic.cooldown_seconds = number_field<int>(dynamic, "cooldown_seconds");
-  if (profile.schema_version != 1 || profile.profile_id.empty() ||
+  if ((profile.schema_version != 1 && profile.schema_version != 2) || profile.profile_id.empty() ||
       profile.generated_at.empty() ||
       (profile.status != "candidate" && profile.status != "tested") ||
       profile.dynamic.small_step_threads < 1 ||
@@ -154,8 +154,8 @@ ThreadProfile load_thread_profile(const std::string &path,
     rule.allowed_cpus = parse_cpu_list(string_field(node, "allowed_cpus").value_or(""));
     rule.dynamic = bool_field(node, "dynamic");
     for (const auto &a : objects(object_after(node, "affinities", '[', ']'))) {
-      rule.affinities.push_back({parse_cpu_list(string_field(a, "cpus").value_or("")),
-                                 number_field<size_t>(a, "count")});
+      // schema v2 has no count; v1 files may still carry one (ignored).
+      rule.affinities.push_back({parse_cpu_list(string_field(a, "cpus").value_or(""))});
     }
     if (!ids.insert(rule.id).second) throw std::runtime_error("duplicate profile rule id: " + rule.id);
     validate_rule(rule, envelope);
@@ -185,16 +185,10 @@ std::optional<ProfileAssignment> profile_assignment(
   for (const auto &rule : profile.placements) {
     if (!profile_rule_matches(rule, sample)) continue;
     size_t instance = next_instances[rule.id]++;
-    size_t offset = 0;
-    for (const auto &affinity : rule.affinities) {
-      if (instance < offset + affinity.count) {
-        ProfileAssignment result{rule.id, instance, affinity.cpus, rule.allowed_cpus, rule.dynamic};
-        assigned.emplace(sample.identity, result);
-        return result;
-      }
-      offset += affinity.count;
-    }
-    return std::nullopt;
+    ProfileAssignment result{rule.id, instance, rule.affinities[0].cpus,
+                             rule.allowed_cpus, rule.dynamic};
+    assigned.emplace(sample.identity, result);
+    return result;
   }
   return std::nullopt;
 }
@@ -205,7 +199,7 @@ void write_thread_profile(const ThreadProfile &profile, const std::string &path)
   std::filesystem::path temporary = output.string() + ".tmp";
   std::ofstream out(temporary);
   if (!out) throw std::runtime_error("cannot write thread profile: " + temporary.string());
-  out << "{\n  \"schema_version\": 1,\n  \"profile_id\": \"" << esc(profile.profile_id)
+  out << "{\n  \"schema_version\": 2,\n  \"profile_id\": \"" << esc(profile.profile_id)
       << "\",\n  \"generated_at\": \"" << esc(profile.generated_at)
       << "\",\n  \"status\": \"" << esc(profile.status) << "\",\n"
       << "  \"source\": {\"commit\": \"" << esc(profile.source_commit)
@@ -229,8 +223,7 @@ void write_thread_profile(const ThreadProfile &profile, const std::string &path)
         << ", \"affinities\": [";
     for (size_t j = 0; j < rule.affinities.size(); ++j) {
       if (j) out << ',';
-      out << "{\"cpus\": \"" << format_cpu_list(rule.affinities[j].cpus)
-          << "\", \"count\": " << rule.affinities[j].count << '}';
+      out << "{\"cpus\": \"" << format_cpu_list(rule.affinities[j].cpus) << "\"}";
     }
     out << "]}" << (i + 1 == profile.placements.size() ? "" : ",") << '\n';
   }

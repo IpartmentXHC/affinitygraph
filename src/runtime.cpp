@@ -275,6 +275,7 @@ Runtime::Runtime(Config config, int root_pid, std::shared_ptr<BpfRingReader> bpf
       bpf_reader_(std::move(bpf_reader)), actuator_(backend_),
       solver_(config_.mode == Mode::Plan) {
   runtime_instance_id_ = monotonic_ns();
+  last_new_profile_match_ns_ = monotonic_ns();
   effective_sample_seconds_ = config_.sample_interval_seconds == 0
                                   ? 1 : config_.sample_interval_seconds;
   hardware_.load_calibration(config_.calibration_path);
@@ -964,12 +965,13 @@ void Runtime::reconcile_and_sample() {
       }
     }
     if (config_.sample_interval_seconds == 0 && static_profile && !sampling_stopped_) {
-      if (profile_new_matches == 0) ++static_quiescent_windows_seen_;
-      else static_quiescent_windows_seen_ = 0;
-      if (static_quiescent_windows_seen_ >= config_.static_quiescent_windows) {
+      const uint64_t now_ns = monotonic_ns();
+      if (profile_new_matches > 0) last_new_profile_match_ns_ = now_ns;
+      else if (now_ns - last_new_profile_match_ns_ >=
+               static_cast<uint64_t>(config_.static_quiescence_seconds) * 1000000000ULL) {
         sampling_stopped_ = true;
-        log("sampling_stopped", "\"quiescent_windows\":" +
-            std::to_string(static_quiescent_windows_seen_) +
+        log("sampling_stopped", "\"quiescence_seconds\":" +
+            std::to_string(config_.static_quiescence_seconds) +
             ",\"sample_interval_seconds\":0");
       }
     }

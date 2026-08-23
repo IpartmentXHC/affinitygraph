@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "profile_id": "clickhouse-threadpool-node2plus3",
   "generated_at": "2026-08-19T00:00:00Z",
   "status": "candidate",
@@ -7,8 +7,8 @@
   "applicability": {"description": "ClickHouse C2T2 pure-read: ThreadPool/clickhouse/Common threads pinned to NUMA node2+3 (64-127), matching 0008 thread-cluster rules.tsv (hot ThreadPool|clickhouse|Common 64-127).", "similarity": {"metric": "", "threshold": null, "reported_gap": null}},
   "dynamic": {"enabled": false, "small_step_threads": 1, "large_change_ratio": 0.3, "large_step_threads": 4, "cooldown_seconds": 10},
   "placements": [
-    {"id": "clickhouse-main-node2plus3", "match": {"comm": "clickhouse", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127", "count": 6}]},
-    {"id": "clickhouse-threadpool-node2plus3", "match": {"comm": "ThreadPool", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127", "count": 38}]},
-    {"id": "clickhouse-common-node2plus3", "match": {"comm": "Common", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127", "count": 8}]}
+    {"id": "clickhouse-main-node2plus3", "match": {"comm": "clickhouse", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127"}]},
+    {"id": "clickhouse-threadpool-node2plus3", "match": {"comm": "ThreadPool", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127"}]},
+    {"id": "clickhouse-common-node2plus3", "match": {"comm": "Common", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127"}]}
   ]
 }

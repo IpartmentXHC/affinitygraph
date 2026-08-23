@@ -16,7 +16,6 @@ struct ThreadProfileMatch {
 
 struct ThreadProfileAffinity {
   std::vector<int> cpus;
-  size_t count = 0;
 };
 
 struct ThreadProfileRule {
@@ -36,7 +35,7 @@ struct ThreadProfileDynamic {
 };
 
 struct ThreadProfile {
-  int schema_version = 1;
+  int schema_version = 2;
   std::string profile_id;
   std::string generated_at;
   std::string status;

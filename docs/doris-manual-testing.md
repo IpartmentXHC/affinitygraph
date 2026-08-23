@@ -351,10 +351,11 @@ sudo -A pkill -x java; sudo -A pkill -x doris_be
 
 ## 5. 场景 3：有 profile 文件的静态调度
 
-profile 放置后**保持不动**，跳过 solver。183 实测表明静态模式下可以
-`sample_interval_seconds=0`：持续采样到 profile 连续
-`static_quiescent_windows` 个窗口无新命中后彻底停止轮询（`sampling_stopped`），
-采样开销趋近于零。
+profile 放置后**保持不动**，跳过 solver。静态模式（`sample_interval_seconds=0`）
+按线程组名扫描：每发现一个匹配线程就绑定到目标 node；连续
+`static_quiescence_seconds`（默认 30）秒无新匹配线程即判定绑定完成并停止轮询
+（`sampling_stopped`），采样开销趋近于零。profile 不含 `count`，不依赖具体
+线程数（数据库按硬件自动调整线程数也能覆盖）。
 
 ### 5.1 写测试配置（静态开关 + 零采样）
 
@@ -364,7 +365,7 @@ sudo -A tee /etc/affinitygraph/targets/doris-s3.toml >/dev/null <<'EOF'
 mode = "active"
 dynamic = false
 sample_interval_seconds = 0
-static_quiescent_windows = 180
+static_quiescence_seconds = 30
 graph_horizon_seconds = 60
 solve_interval_seconds = 10
 minimum_confidence = 0.8
@@ -398,10 +399,10 @@ EOF
 >   `dynamic.enabled=true` 也会被覆盖；不写该键时由 profile 的
 >   `dynamic.enabled` 决定。
 > - `sample_interval_seconds=0` **仅静态模式合法**（动态模式会
->   `sampling: fail`）；`static_quiescent_windows=180` 表示连续 180 个窗口
->   无新命中后停采样。Doris 线程池慢启动，183 实测 180 较稳（ClickHouse 用 60）。
-> - 想保留低频轮询（新线程仍会被放置）可设 `sample_interval_seconds=30~60`
->   并去掉 quiescent 逻辑。
+>   `sampling: fail`）；`static_quiescence_seconds=30` 表示 30 秒内没有新的
+>   匹配线程出现就判定绑定完成并停采样。线程池慢启动的库可调大（如 60）。
+> - 绑定完成后采样停止，之后新建的匹配线程**不再自动绑定**；如工作负载
+>   运行期会创建新线程，请改用场景 2（动态）或设 `sample_interval_seconds>0`。
 
 ### 5.2 preflight
 
@@ -499,7 +500,7 @@ tests/manual-scenarios.sh --db doris --dry-run
 `DORIS_HOME`、`DORIS_FE_START`、`DORIS_BE_START`、`DORIS_PROFILE`、
 `DORIS_CPUS`、`DORIS_RUN_USER`（默认 root，设空则不带 `--user`）、
 `DORIS_READY_PORT`（默认 9030，baseline 就绪判定端口）、
-`DORIS_QUIESCENT_WINDOWS`、`TARGETS_DIR`、`PROFILES_DIR`、`CALIBRATION_DIR`、
+`DORIS_QUIESCENCE_SECONDS`（默认 30）、`TARGETS_DIR`、`PROFILES_DIR`、`CALIBRATION_DIR`、
 `SUDO_ASKPASS`、`READY_TIMEOUT_SECONDS` 等。
 非 root 用户运行时自动经 `SUDO_ASKPASS + sudo -A` 提权；baseline 需以非 root
 运行数据库时自动经 `runuser -u <user>` 启动。
@@ -507,38 +508,24 @@ tests/manual-scenarios.sh --db doris --dry-run
 脚本只负责启动与调度状态校验；**正式 YCSB 测量请在另一终端按第 3.5 节手动
 执行**。
 
-另有 `tests/export-profile.sh` 用于在新机器上由方案一观测生成
-profile（见 6.1）。
-
 ### 6.1 在新机器上生成 profile（换硬件）
 
-profile 的 `count` 只是放置上限（超出不放置），CPU 集合必须落在新机器资源
-信封内（越界 preflight 会拒绝）。线程数常随核数变化，换机器后需要重新观测。
-流程：新机器上用**方案一**（无 profile 动态调度）跑真实 workload，等 solver
-稳定放置后，用 `tests/export-profile.sh` 按旧 profile 的 comm 白名单聚合观测
-结果，生成静态新 profile。
+profile **不依赖具体线程数**（无 `count` 字段）：每条规则 = 线程组名白名单
+（`comm`/`comm_prefix`）+ 一个目标 CPU 集合。新机器上不需要重新观测线程数量，
+只需把旧模板里 `allowed_cpus` 与 `affinities[].cpus` 改成新机器目标 node 的
+CPU 集合（`lscpu -e=CPU,NODE` 确认，必须落在资源信封内），其余保持不变。
 
 ```sh
-# 1) 新机器：构建 + 校准 + 就绪检查（路径按实际替换）
-make all CXX=/usr/bin/clang++-18 CLANG=/usr/bin/clang-18
-sudo -A make calibrate
-sudo -A ./build/affinity-run preflight --config config/affinitygraph.toml \
-  --bpf-object build/affinitygraph.bpf.o
+# 1) 拷贝模板（Doris 示例）
+cp /etc/affinitygraph/profiles/doris-node2-dynamic.candidate.json \
+   /etc/affinitygraph/profiles/doris-newhost.candidate.json
 
-# 2) 方案一启动 Doris 并跑真实 workload（见第 3 节），等 solver 稳定放置
-#    确认有放置：affinityctl status 的 planned_assignments 非空
+# 2) 编辑为新机器目标 node 的 CPU 集合（示例 node2 = 0-31）：
+#    "schema_version": 2
+#    "allowed_cpus": "0-31"
+#    "affinities": [{"cpus": "0-31"}]
 
-# 3) 生成新 profile（--allowed-cpus 填新机器目标 node 的 CPU 集合）
-tests/export-profile.sh --db doris \
-  --socket /tmp/affinitygraph-doris-s1.sock \
-  --log /var/log/affinitygraph-doris-s1/runtime.jsonl \
-  --template /etc/affinitygraph/profiles/doris-node2-dynamic.candidate.json \
-  --allowed-cpus 0-31 \
-  --output /etc/affinitygraph/profiles/doris-newhost.candidate.json \
-  --profile-id doris-newhost-r1
-# 脚本自动跑 preflight；期望 thread_profile: ok (N placement rule(s), static)
-
-# 4) 场景 2/3 复现：先 preflight 再启动（见第 4/5 节）
+# 3) preflight 校验（期望 thread_profile: ok (N placement rule(s), static)）
 sudo -A ./build/affinity-run preflight \
   --config /etc/affinitygraph/targets/doris-s3.toml \
   --thread-profile /etc/affinitygraph/profiles/doris-newhost.candidate.json \
@@ -547,12 +534,14 @@ sudo -A ./build/affinity-run preflight \
 
 要点：
 
-- `--allowed-cpus` 必填，必须在新机器资源信封内（`lscpu -e=CPU,NODE` 确认）。
-- 脚本只聚合 `--template` 白名单内的 comm（线程组不变），
-  `affinities[].cpus` 与 `count` 取观测结果；白名单内未观测到的 comm 跳过并
-  告警（不生成空规则）；`planned_assignments` 为空时提示先等 solver 稳定。
+- 运行时按线程组名扫描，每发现一个匹配线程就绑定到目标 CPU 集合；30 秒
+  （`static_quiescence_seconds`）无新匹配线程即判定绑定完成并停止扫描，
+  所以无需知道/配置线程数。
 - 生成的 profile 为静态（`dynamic.enabled=false`）；需要动态微调时把顶层
   `dynamic.enabled` 改为 `true` 再按场景 2 使用。
+- 新机器如有不同数据库版本导致线程组名变化，先用方案一观察实际 comm，
+  再调整匹配规则。
+
 
 
 ## 7. 日志速查
@@ -576,8 +565,9 @@ sudo -A tail -30 /tmp/affinity-doris-sN.log
 - **`active_effective=false` 是不是没生效？** 静态场景（场景 3）这是设计行为；
   动态场景（1/2）它应为 true，若为 false 检查 `solver_phase`、`pinned_threads`、
   决策窗口日志。
-- **`sampling_stopped` 后还能放置新线程吗？** 不能，采样已停；如有新进程
-  需要重新评估，请调大 `static_quiescent_windows` 或用
+- **`sampling_stopped` 后还能放置新线程吗？** 不能，采样已停；绑定完成后
+  新建的匹配线程不再自动绑定。如工作负载运行期会创建新线程，请调大
+  `static_quiescence_seconds`、改用场景 2（动态），或设
   `sample_interval_seconds>0`。
 - **为什么场景 1 迁移很少？** solver 需要跨窗口积累证据，且受
   `minimum_confidence`/`proposal_confirmations`/`maximum_migrated_threads_ratio`

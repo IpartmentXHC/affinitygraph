@@ -64,7 +64,7 @@ void test_cpu_lists() {
           "per-thread configuration parsed");
   auto static_config = load_config("tests/fixtures/config-static-sample0.toml");
   require(!static_config.dynamic && static_config.sample_interval_seconds == 0 &&
-              static_config.static_quiescent_windows == 3,
+              static_config.static_quiescence_seconds == 30,
           "static sample-zero configuration parsed");
   bool invalid_rejected = false;
   try {
@@ -72,38 +72,69 @@ void test_cpu_lists() {
   } catch (const std::exception &) {
     invalid_rejected = true;
   }
-  require(invalid_rejected, "static_quiescent_windows < 1 rejected");
+  require(invalid_rejected, "static_quiescence_seconds < 1 rejected");
 }
 
 void test_thread_profile() {
   auto profile = load_thread_profile("tests/fixtures/thread-profile-small.json", {0, 1, 2, 3});
-  require(profile.placements.size() == 1 && profile.dynamic.large_step_threads == 4,
-          "thread profile loads");
+  require(profile.schema_version == 2 && profile.placements.size() == 1 &&
+              profile.dynamic.large_step_threads == 4,
+          "thread profile v2 loads");
+  require(profile.placements[0].affinities.size() == 1 &&
+              profile.placements[0].affinities[0].cpus == std::vector<int>({0}),
+          "v2 rule has a single affinity without count");
   ThreadSample worker = sample(10, 1, 0, 0);
   worker.comm = "worker";
   worker.cgroups = {"/job"};
   std::map<std::string, size_t> instances;
   std::map<ThreadIdentity, ProfileAssignment> assigned;
   auto first = profile_assignment(profile, worker, instances, assigned);
-  require(first && first->target_cpus == std::vector<int>({0}), "first profile assignment");
+  require(first && first->target_cpus == std::vector<int>({0}) && first->instance == 0,
+          "first profile assignment");
   worker.identity = {100, 11, 2};
   auto second = profile_assignment(profile, worker, instances, assigned);
-  require(second && second->target_cpus == std::vector<int>({0}), "count distribution assignment");
+  require(second && second->target_cpus == std::vector<int>({0}) && second->instance == 1,
+          "every matching thread binds to the same target");
   worker.identity = {100, 12, 3};
   auto third = profile_assignment(profile, worker, instances, assigned);
-  require(third && third->target_cpus == std::vector<int>({1}), "next affinity assignment");
-  worker.identity = {100, 13, 4};
-  require(!profile_assignment(profile, worker, instances, assigned), "profile overflow is unmanaged");
+  require(third && third->target_cpus == std::vector<int>({0}) && third->instance == 2,
+          "no count cap: all matching threads are bound");
   bool rejected = false;
   try { load_thread_profile("tests/fixtures/thread-profile-small.json", {0}); }
   catch (...) { rejected = true; }
   require(rejected, "profile outside envelope rejected");
+  auto v1 = load_thread_profile("tests/fixtures/thread-profile-v1-count.json", {0, 1, 2, 3});
+  require(v1.schema_version == 1 && v1.placements.size() == 1 &&
+              v1.placements[0].affinities.size() == 1 &&
+              v1.placements[0].affinities[0].cpus == std::vector<int>({1}),
+          "v1 profile with count loads, count ignored");
+  bool multi_rejected = false;
+  {
+    const char *multi = R"({
+      "schema_version": 2,
+      "profile_id": "multi", "generated_at": "2026-08-23T00:00:00Z", "status": "candidate",
+      "source": {"commit": "", "experiment_id": "", "test_id": ""},
+      "applicability": {"description": "", "similarity": {"metric": "", "threshold": null, "reported_gap": null}},
+      "dynamic": {"enabled": false, "small_step_threads": 1, "large_change_ratio": 0.3, "large_step_threads": 4, "cooldown_seconds": 10},
+      "placements": [
+        {"id": "multi", "match": {"comm": "worker", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null},
+         "allowed_cpus": "0-3", "dynamic": false,
+         "affinities": [{"cpus": "0"}, {"cpus": "1"}]}
+      ]
+    })";
+    std::ofstream("/tmp/affinitygraph-multi-affinity.json") << multi;
+    try { load_thread_profile("/tmp/affinitygraph-multi-affinity.json", {0, 1, 2, 3}); }
+    catch (...) { multi_rejected = true; }
+  }
+  require(multi_rejected, "multi-affinity rule rejected");
   profile.status = "candidate";
   profile.generated_at = "2026-08-12T00:00:00Z";
   write_thread_profile(profile, "/tmp/affinitygraph-thread-profile-test.json");
   auto roundtrip = load_thread_profile("/tmp/affinitygraph-thread-profile-test.json", {0, 1, 2, 3});
-  require(roundtrip.placements.size() == 1 && roundtrip.placements[0].affinities.size() == 2,
-          "thread profile export roundtrip");
+  require(roundtrip.schema_version == 2 && roundtrip.placements.size() == 1 &&
+              roundtrip.placements[0].affinities.size() == 1 &&
+              roundtrip.placements[0].affinities[0].cpus == std::vector<int>({0}),
+          "thread profile export roundtrip (v2, single affinity)");
   auto empty = load_thread_profile("config/thread-profiles/runtime-only-empty.json", {0, 1, 2, 3});
   require(empty.placements.empty() && !empty.dynamic.enabled,
           "runtime-only empty profile loads without placement rules");

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "profile_id": "doris-light-pipe-node2-c4t4",
   "generated_at": "2026-08-12T00:00:00Z",
   "status": "candidate",
@@ -25,14 +25,14 @@
       "match": {"comm": "brpc_light", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null},
       "allowed_cpus": "64-95",
       "dynamic": false,
-      "affinities": [{"cpus": "64-95", "count": 512}]
+      "affinities": [{"cpus": "64-95"}]
     },
     {
       "id": "doris-pipe-normal-node2",
       "match": {"comm": null, "comm_prefix": "Pipe_normal", "cgroup": null, "cgroup_prefix": null, "tid": null},
       "allowed_cpus": "64-95",
       "dynamic": false,
-      "affinities": [{"cpus": "64-95", "count": 128}]
+      "affinities": [{"cpus": "64-95"}]
     }
   ]
 }

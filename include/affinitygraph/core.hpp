@@ -19,7 +19,7 @@ enum class Mode { Observe, Plan, Active };
 struct Config {
   Mode mode = Mode::Observe;
   bool dynamic = true;
-  int static_quiescent_windows = 3;
+  int static_quiescence_seconds = 30;
   std::vector<int> cpus;
   std::string calibration_path;
   std::string log_directory = "/tmp/affinitygraph";

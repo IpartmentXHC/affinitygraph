@@ -120,7 +120,7 @@ private:
   Config config_;
   int effective_sample_seconds_ = 1;
   bool sampling_stopped_ = false;
-  int static_quiescent_windows_seen_ = 0;
+  uint64_t last_new_profile_match_ns_ = 0;
   int root_pid_ = -1;
   int supervisor_pid_ = -1;
   bool collector_degraded_ = false;
