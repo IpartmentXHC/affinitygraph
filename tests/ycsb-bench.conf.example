@@ -1,0 +1,54 @@
+# YCSB 压测配置示例（183 默认值）
+#
+# 用法:
+#   cp tests/ycsb-bench.conf.example tests/ycsb-bench.conf   # 然后按需修改
+#   tests/run-ycsb-bench.sh [--config tests/ycsb-bench.conf]
+#
+# 所有键都可被同名环境变量覆盖；--clients/--threads/--rounds/--tag 再覆盖环境变量。
+# 本配置文件只描述压测负载；数据库与 affinity-run 由 tests/manual-scenarios.sh 管理。
+
+# ---- YCSB 安装与环境 ----
+YCSB_HOME=/home/xhc/ycsb-jdbc-binding-0.17.0
+# YCSB_ENTRY 默认 $YCSB_HOME/bin/ycsb（python2 包装脚本）
+# PYTHON2_LIB: python2 动态库目录，非空时设置 LD_LIBRARY_PATH；留空则不设置
+PYTHON2_LIB=/usr/local/python2.7/lib
+
+# ---- 负载参数（原样透传给 ycsb run jdbc）----
+WORKLOAD=workloads/workloada_clickhouse_numa_read
+PROPERTIES=conf/db_183_clickhouse.properties
+JDBC_CP=lib/mysql-connector-java-8.0.28.jar
+TABLE=usertable
+STATUS_INTERVAL=10
+# EXTRA_YCSB_ARGS 原样拼接到命令尾部（如 "-p fieldlength=100"）
+EXTRA_YCSB_ARGS=
+
+# ---- 多客户端矩阵 ----
+# CLIENT_HOSTS: 逗号分隔，条目数 = 客户端进程数；local=本机，其余为 ssh 目标
+#   （ssh 用 ~/.ssh/config 别名即可）。留空则退化为 CLIENTS 个 local 进程。
+# 示例:
+#   CLIENT_HOSTS=local,local,local,local          # C4T4 全本机
+#   CLIENT_HOSTS=local,197                        # 2 客户端: 本机 + 197
+CLIENTS=4
+CLIENT_HOSTS=local,local,local,local
+THREADS_PER_CLIENT=4
+# 每客户端操作数；留空 = 不传 -p operationcount（用 workload 默认 recordcount）
+OPERATIONCOUNT_PER_CLIENT=8000
+
+# ---- 轮次 ----
+ROUNDS=3
+ROUND_INTERVAL_SECONDS=10
+# 每轮正式测量前的预热操作数；0 = 跳过预热
+WARMUP_OPS=0
+
+# ---- 就绪检查（可选；READY_PORT 留空 = 跳过）----
+READY_HOST=127.0.0.1
+READY_PORT=9004
+READY_TIMEOUT_SECONDS=60
+
+# ---- 输出 ----
+LOG_DIR=/tmp/ycsb-bench
+# RUN_TAG 留空 = 自动时间戳；日志布局: $LOG_DIR/<tag>/round-<r>/client-<i>.log
+RUN_TAG=
+
+# ---- ssh（远程客户端；默认 BatchMode 避免卡在密码交互）----
+SSH_OPTIONS="-o BatchMode=yes -o ConnectTimeout=10"

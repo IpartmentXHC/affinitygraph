@@ -9,6 +9,8 @@
   "placements": [
     {"id": "clickhouse-main-node2plus3", "match": {"comm": "clickhouse", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127"}]},
     {"id": "clickhouse-threadpool-node2plus3", "match": {"comm": "ThreadPool", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127"}]},
-    {"id": "clickhouse-common-node2plus3", "match": {"comm": "Common", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127"}]}
+    {"id": "clickhouse-common-node2plus3", "match": {"comm": "Common", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127"}]},
+    {"id": "clickhouse-qpipeline-node2plus3", "match": {"comm": "QueryPipelineEx", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127"}]},
+    {"id": "clickhouse-handler-node2plus3", "match": {"comm": "MySQLHandler", "comm_prefix": null, "cgroup": null, "cgroup_prefix": null, "tid": null}, "allowed_cpus": "64-127", "dynamic": false, "affinities": [{"cpus": "64-127"}]}
   ]
 }
