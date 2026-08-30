@@ -557,7 +557,184 @@ sudo -A ./build/affinity-run preflight \
 
 
 
-## 7. 日志速查
+## 7. 大表构建、NUMA 探针与正式 A/B（ClickHouse 大表 + 扫描/聚合负载）
+
+背景：第 2/3/5 节用的是 105 MiB 小表点查（`workloada_clickhouse_numa_read`），
+服务端成本被 JDBC 客户端开销淹没，测不到 NUMA 收益。本节切换到 ≤10GB 大表 +
+扫描/聚合负载：先用受控四臂探针判定「扫描/聚合是否受 CPU 亲和性影响」（Gate），
+通过后再做正式 A/B。
+
+### 7.1 大表 usertable_big（键格式与 YCSB 逐字节一致）
+
+`tests/ch-bigtable-build.sh` 生成 `ycsb.usertable_big`：`YCSB_KEY String` 主键 +
+`field0..field9 String`，`MergeTree PRIMARY KEY YCSB_KEY ORDER BY YCSB_KEY
+SETTINGS index_granularity=8192`。键 = `"user" + %019d(Math.abs(fnvhash64(keynum)))`，
+与 YCSB `CoreWorkload.buildKeyName` + `Utils.fnvhash64`（FNV-1a 64：offset
+`0xCBF29CE484222325`、prime `1099511628211`、8 字节小端、末尾 `Math.abs`）
+逐字节一致，所以**不需要跑 YCSB load**，纯 SQL `INSERT ... SELECT numbers(N)`
+即可。
+
+```sh
+cd ~/affinitygraph
+tests/ch-bigtable-build.sh --dry-run   # 先看生成的 SQL（FNV WITH 链 + randomPrintableASCII(100)）
+tests/ch-bigtable-build.sh             # 默认 12M 行；建完查 count() 与 system.parts.bytes_on_disk
+tests/ch-bigtable-build.sh --verify    # 抽样 5 键 vs Python 参考 + 1000 随机键 IN 点查 count()=1000
+tests/ch-bigtable-build.sh --drop      # 重建（默认已存在且行数一致时跳过插入）
+```
+
+- 环境变量：`CH_CLIENT/CH_HOST/CH_PORT`（native 9000）、`CH_DATABASE/CH_TABLE`、
+  `BIG_TABLE_ROWS`（默认 12000000）、`BIG_TABLE_MAX_GB`（默认 10）。
+- 表磁盘占用（`system.parts.bytes_on_disk`）超过 `BIG_TABLE_MAX_GB` 时脚本打印
+  建议行数并非零退出，**不自动重建**。
+- 12M 行原始约 12GB，压缩后预计 6–9GB；超限就按提示调小 `BIG_TABLE_ROWS`。
+
+### 7.2 四臂 NUMA 探针
+
+`tests/ch-numa-probe.sh` 自动跑四臂（脚本会接管 ClickHouse 生命周期：每臂
+stop→start→就绪→探针→stop，结束后恢复原启动方式）：
+
+| 臂 | CPU 亲和 | 内存 | 说明 |
+| --- | --- | --- | --- |
+| A | 自然分布 | 自然 | 现状基线，无任何干预 |
+| B | 不 pin | membind node2 | 仅约束用户态内存；静态模式无 profile 时 affinity-run 拒绝启动，故直接 `numactl` 包 CH |
+| C | pin node2+3（64-127） | membind node2 | 本地访问：`clickhouse-threadpool-node2plus3.candidate.json` |
+| D | pin node0/1（0-63） | membind node2 | 远端访问：探针专用副本（cpus→0-63，仅 /tmp，不进正式候选） |
+
+```sh
+cd ~/affinitygraph
+tests/ch-numa-probe.sh --dry-run        # 只打印将执行的命令
+tests/ch-numa-probe.sh                  # A→B→C→D；A 臂后交互暂停检查（PROBE_PAUSE_AFTER_A=0 关）
+tests/ch-numa-probe.sh --arm C          # 只跑某一臂（排障用）
+```
+
+探针负载（183 本机 HTTP keep-alive，优先 python3，缺则 bash `/dev/tcp` 降级）：
+先预热 page cache，然后
+
+- `Q1` 点查（命中键）：`SELECT count(), sum(length(field0..9)) WHERE YCSB_KEY = ?`
+- `Q2-<t>` 范围聚合：`SELECT count(), sum(length(field0..9)) WHERE YCSB_KEY >= ? AND < ?`
+  （覆盖约 1M/5M/10M 行；键界在显示键空间按 `L = t·2^63/N` 反推）
+- `Q3-<t>` 服务端纯 scan：`SELECT count() FROM (SELECT YCSB_KEY FROM t LIMIT ?)`
+  （只传一列，避免客户端传输稀释服务端成本）
+
+输出每臂 p50/p95 与 C vs D 差值；原始记录在
+`/tmp/ch-numa-probe/probe-{A,B,C,D}.tsv`。可调：`PROBE_CONCURRENCY`（默认 16）、
+`PROBE_ITERATIONS`（20）、`PROBE_Q2_ROWS`、`PROBE_Q3_LIMITS`、`PROBE_TABLE`、
+`PROBE_EXPECT_ROWS` 等。
+
+> Q2 键界说明：`Math.abs` 使显示键折叠到 `[0, 2^63)`，键在显示空间的密度是
+> `N/2^63`，覆盖 t 行的范围长度 `L = t·2^63/N`（不是 `t·2^64/N`）。
+
+### 7.3 Gate 判定
+
+同一数据布局下，C（本地）vs D（远端）服务端 p50 差 ≥10% 且 p95 同向
+（Q2/Q3 任一命中即算；方向不敏感，C 更快或 D 更快都算）：
+
+- 命中 →「扫描/聚合受 CPU 亲和性影响、有研究必要」→ 进入 7.4 正式 A/B，
+  最终 workload 保留 `scan=0.10`；
+- 未命中 → 输出「该负载形态无研究必要」，不加 scan（或仅 read）。
+
+### 7.4 正式 A/B（read 0.90 + scan 0.10）
+
+workload 模板 `tests/workloads/clickhouse_numa_scan.properties`：
+`readproportion=0.90`、`scanproportion=0.10`、`scanlengthdistribution=uniform`、
+`maxscanlength=1000`、`requestdistribution=zipfian`、`zeropadding=19`（**必须**，
+YCSB 默认 `zeropadding=1` 与表键格式不一致）。
+
+```sh
+# 前置: cp tests/ycsb-bench.conf.example tests/ycsb-bench.conf，并把 CLIENT_HOSTS 留空
+#       （CLIENTS 由 --clients 覆盖 → 197 个 local 进程，见 3.5 节说明）
+# 每臂（baseline / C / D）各 3 轮；EXTRA_YCSB_ARGS 叠加模板 + recordcount
+EXTRA_YCSB_ARGS="-P /home/xhc/affinitygraph/tests/workloads/clickhouse_numa_scan.properties -p recordcount=12000000" \
+  tests/run-ycsb-bench.sh --config tests/ycsb-bench.conf --clients 197 --rounds 3 --tag numa-scan-C
+# baseline 与 D 臂同样各跑一遍（tag 区分）
+```
+
+`run-ycsb-bench.sh` 汇总端到端吞吐 mean/stddev（辅助口径）；服务端耗时用
+`system.query_log` 交叉验证（config.xml 需 `log_queries` 开启，默认开）：
+
+```sql
+SELECT quantile(0.50)(query_duration_ms) AS p50, quantile(0.95)(query_duration_ms) AS p95,
+       count() AS n
+FROM system.query_log
+WHERE event_time > now() - INTERVAL 20 MINUTE
+  AND query LIKE '%usertable_big%' AND type = 'QueryFinish';
+```
+
+最终报告以服务端 p50 差为主口径、端到端吞吐为辅助口径。若 Gate 显示仅
+Q2/Q3 聚合敏感而 JDBC scan 形态被传输稀释，则补一轮 7.2 探针作为代表性负载
+的正式对照（记录服务端耗时分布）。
+
+### 7.5 恢复
+
+探针/正式 A/B 结束后脚本自动恢复；手动恢复（杀掉 membind/affinity-run 实例后
+用原命令重启，`SELECT 1` 轮询就绪）：
+
+```sh
+sudo -A pkill -x affinity-run; sudo -A pkill -x clickhouse; sudo -A pkill -x clckhouse-watch
+sudo -A nohup /home/xhc/clickhouse/ClickHouse/build/programs/clickhouse server \
+  --config-file /home/xhc/clickhouse/etc/config.xml \
+  > /tmp/affinity-clickhouse-baseline.log 2>&1 &
+until timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9004' 2>/dev/null; do sleep 5; done
+sudo -A /home/xhc/clickhouse/ClickHouse/build/programs/clickhouse client --query "SELECT 1"
+```
+
+`usertable_big` 默认保留供复测；不再需要时：
+
+```sh
+sudo -A /home/xhc/clickhouse/ClickHouse/build/programs/clickhouse client \
+  --query 'DROP TABLE IF EXISTS ycsb.usertable_big'
+```
+
+### 7.6 实测记录（183，2026-08-24）
+
+本节在 183 上按 7.1–7.3 实际执行一遍后的结果与注意事项（供复测对照）。
+
+**建表与校验**
+
+- 12M 行建出后 `system.parts.bytes_on_disk = 11.51GB`，超过 10GB 上限，脚本按
+  提示非零退出；改 `BIG_TABLE_ROWS=9900000` 重建：**9,900,000 行、9.50GB**。
+- `tests/ch-bigtable-build.sh --verify`（`BIG_TABLE_ROWS=9900000`）通过：抽样
+  5 个键与 Python 参考逐字节一致；1000 个随机键 `IN` 点查 `count()=1000`
+  （读取命中率 100%）。`ycsb.usertable_big` 保留在 183 供复测。
+
+**四臂探针结果**（每臂 20 次迭代、并发 16；p50 为服务端耗时 ms，来自
+`/tmp/ch-numa-probe/probe-{A,B,C,D}.tsv`）
+
+| qid | A（自然） | B（membind） | C（pin node2+3） | D（pin node0/1） |
+| --- | --- | --- | --- | --- |
+| Q1 | 206.4 | 150.0 | 162.9 | 184.1 |
+| Q2-1M | 1367.2 | 5568.7 | 5222.0 | 5740.9 |
+| Q2-5M | 6073.6 | 25860.7 | 23447.3 | 24968.0 |
+| Q2-10M | 10982.1 | 46300.0 | 45331.4 | 47971.3 |
+| Q3-1M | 88.2 | 389.9 | 303.6 | 328.2 |
+| Q3-5M | 164.1 | 831.2 | 603.9 | 651.4 |
+| Q3-10M | 251.9 | 1089.3 | 795.6 | 851.9 |
+
+绑定有效性：C 臂 333 条 `profile_match` 全部 `target_cpus:"64-127"`
+（末次 `initial_affinity` committed=14）；D 臂 305 条全部 `"0-63"`
+（committed=2），静态绑定生效。
+
+**Gate 结论：未命中 → 不进入正式 A/B**
+
+C vs D（同为 membind，仅 CPU pin 不同）Q2/Q3 服务端 p50 差分别为
+9.9% / 6.5% / 5.8%（Q2-1M/5M/10M）与 8.1% / 7.9% / 7.1%（Q3-1M/5M/10M），
+全部 <10%，p95 也未同向显著（最大 21.9% 仅在 Q3-1M，p50 未达阈值）→ 按 7.3
+判定「**该负载形态无研究必要（扫描/聚合不受显著 CPU 亲和性影响）**」，最终
+workload 不加 scan（或仅 read），7.4 的正式 A/B 与 197 客户端测量不执行。
+
+**183 特有注意事项（复测/换机对照）**
+
+- multi-call 二进制必须带子命令：`CH_CLIENT="/home/xhc/clickhouse/ClickHouse/build/programs/clickhouse client"`，
+  裸 `--host` 会报 Unrecognized option。
+- CH 以非 root 用户 `xhc` 运行（数据属主 xhc）：root 直接启动报 Code: 430，
+  需 `CLICKHOUSE_RUN_USER=xhc`（脚本已自动经 `runuser -u xhc --` 启动）。
+- `numactl` 不认 node 名字：membind 必须写数字，`PROBE_MEMBIND_NODE=2`。
+- 183 的 `system.query_log` 未启用（表不存在），7.4 的 query_log 服务端耗时
+  交叉验证在 183 不可用；复测若需要，先开 `log_queries` 并重启 CH。
+- Q1 p50 偏大（与 Q2/Q3 重查询混跑排队所致；空闲时点查约 0.1–0.2ms），
+  Q1 不参与 Gate。Q2-10M 实际覆盖 9,801,110 行（`t>N` 时夹到 99% 键界）。
+
+## 8. 日志速查
 
 ```sh
 # runtime 全量事件
@@ -571,7 +748,7 @@ sudo -A grep -E '"type":"(solve_window_end|action|action_commit|sampling_stopped
 sudo -A tail -30 /tmp/affinity-clickhouse-sN.log
 ```
 
-## 8. FAQ
+## 9. FAQ
 
 - **`--user root` 与数据属主？** ClickHouse 要求进程用户与数据目录属主一致。
   数据为 root 属主时默认 `--user root` 正确；数据为 xhc 等非 root 属主时，
