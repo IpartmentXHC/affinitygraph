@@ -1,7 +1,7 @@
 # ClickHouse 手动测试教程（不使用 YBA）
 
 面向**手动启动 ClickHouse + YCSB** 的压测场景：不用 YBA 编排，直接用
-`affinity-run` 监督 ClickHouse 进程，用 YCSB 打负载。覆盖四个场景：
+`affinity-run` 监督 ClickHouse 进程，用 YCSB 打负载。覆盖五个场景：
 
 | 场景 | profile | 调度方式 | 预期行为 |
 | --- | --- | --- | --- |
@@ -9,13 +9,14 @@
 | 1 | 无 | 动态 | runtime 自行采样、决策并迁移线程（`mode=active` 一步闭环） |
 | 2 | 有 | 动态 | profile 先做初始放置，solver 再在其上增量微调 |
 | 3 | 有 | 静态 | profile 放置后保持不动（`dynamic=false` + 可 `sample_interval_seconds=0` 停止采样） |
+| 4 | 无 | `numactl -C` 绑核 | 数据库及子线程固定在指定 CPU 上，不启动 AffinityGraph |
 
 文中命令以 183 上的默认路径为准（`/home/xhc/...`、`/etc/affinitygraph/...`）；
-换机器时替换成你的实际路径。四场景也可用 `tests/manual-scenarios.sh --db
-clickhouse` 自动跑（见第 6 节）。Doris 版教程见 `docs/doris-manual-testing.md`，
+换机器时替换成你的实际路径。五场景也可用 `tests/manual-scenarios.sh --db
+clickhouse` 自动跑（见第 7 节）。Doris 版教程见 `docs/doris-manual-testing.md`，
 两文结构相同，本章只强调 ClickHouse 差异。
 
-## 0. 前置准备（四种场景通用）
+## 0. 前置准备（五种场景的基础准备）
 
 ```sh
 # 1) 构建（make all 已包含用户态程序 + BPF 对象 build/affinitygraph.bpf.o）
@@ -44,7 +45,8 @@ sudo -A ./build/affinity-run preflight --config config/affinitygraph.toml \
   降权为 root 运行。**ClickHouse 要求进程用户与数据目录属主一致**：数据为
   root 属主时用默认（`CLICKHOUSE_RUN_USER=root`）；数据为 xhc 等非 root
   属主时，设 `CLICKHOUSE_RUN_USER=xhc` 或置空，否则报 Code: 430。
-- **BPF 必须 ok**：`collector.required=true` 下 `bpf: fail` 会直接拒绝启动。
+- **BPF 只适用于 S1-S3**：`collector.required=true` 下 `bpf: fail` 会直接拒绝启动。
+  S0/S4 不启动 `affinity-run`，不需要 BPF 或 AffinityGraph preflight。
 
 ## 1. 拓扑与关键参数（183）
 
@@ -67,15 +69,15 @@ share_log_p95 = 0.00894730347830295
 
 - 参考静态 profile（`config/thread-profiles/clickhouse-threadpool-node2plus3.candidate.json`）：
   `clickhouse`×6、`ThreadPool`×38、`Common`×8 → `64-127`
-- 三个场景各自独立的 socket/日志目录，互不干扰：
+- S1/S2/S3 各自使用独立的 socket/日志目录，互不干扰：
   `/tmp/affinitygraph-clickhouse-s{1,2,3}.sock`、
   `/var/log/affinitygraph-clickhouse-s{1,2,3}/runtime.jsonl`
 
 ## 2. 场景 0：baseline（对照基线）
 
-不启动 affinitygraph，直接启动 ClickHouse，测量无干预的基线吞吐，作为
-场景 1/2/3 的对照（脚本 `tests/manual-scenarios.sh --db clickhouse` 默认
-包含该场景）。
+不启动 affinitygraph，直接启动 ClickHouse，测量无干预的自然基线吞吐，作为
+场景 1/2/3/4 的对照（脚本 `tests/manual-scenarios.sh --db clickhouse` 默认
+包含这些场景）。
 
 ```sh
 # 直接启动 ClickHouse（等价于脚本场景 0 的命令；数据为 root 属主时用此命令）
@@ -486,20 +488,69 @@ sudo -A grep -E '"type":"(pause|runtime_stop)"' \
 sudo -A pkill -x clickhouse; sudo -A pkill -x clckhouse-watch
 ```
 
-## 6. 自动化脚本
+## 6. 场景 4：CPU 绑核基线（S0 的绑核版）
 
-`tests/manual-scenarios.sh` 自动完成四个场景（0=baseline，1-3=affinitygraph）：
-场景 0 直接启动数据库测基线；场景 1-3 按场景生成独立 toml、生成/选用
+S4 与 S0 使用完全相同的 ClickHouse 启动方式和 YCSB 负载，唯一差异是在最外层
+使用 `numactl -C` 固定数据库进程的 CPU affinity。默认 CPU 列表为 `0-31`，
+也可以在启动时替换为其他合法的 Linux CPU 列表。
+
+S4 不启动 `affinity-run`，不读取 Profile，不运行动态 Solver，也不设置
+NUMA 内存绑定；它只用于测量“固定 CPU、Linux 默认调度”这一对照条件。
+
+### 6.1 启动 ClickHouse
+
+```sh
+S4_CPUS=${S4_CPUS:-0-31}
+command -v numactl >/dev/null || { echo "缺少 numactl" >&2; exit 1; }
+
+sudo -A nohup numactl -C "$S4_CPUS" \
+  /home/xhc/clickhouse/ClickHouse/build/programs/clickhouse server \
+  --config-file /home/xhc/clickhouse/etc/config.xml \
+  > /tmp/affinity-clickhouse-s4.log 2>&1 &
+```
+
+等待 ClickHouse 端口就绪，并检查数据库进程是否继承了 S4 的 CPU 掩码：
+
+```sh
+until timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9004' 2>/dev/null; do sleep 5; done
+
+for pid in $(sudo -A pgrep -x clickhouse); do
+  sudo -A taskset -pc "$pid"
+done
+# 期望输出的 current affinity 与 S4_CPUS 一致，例如 0-31
+```
+
+### 6.2 YCSB 测量与停止
+
+YCSB 测量命令同 3.5 节，记录 S4 的 `[OVERALL] Throughput(ops/sec)`。
+测量结束后停止 ClickHouse：
+
+```sh
+sudo -A pkill -x clickhouse
+sudo -A pkill -x clckhouse-watch
+```
+
+S4 的 CPU 绑定不等同于 `numactl --membind`：它约束可运行的 CPU，内存仍由
+Linux 默认 NUMA 策略分配。
+
+## 7. 自动化脚本
+
+`tests/manual-scenarios.sh` 自动完成五个场景（0/4=无 affinitygraph，1-3=affinitygraph）：
+场景 0 直接启动数据库测自然基线；场景 4 使用 `numactl -C` 测绑核基线；场景 1-3 按场景生成独立 toml、生成/选用
 profile、启动 affinity-run、轮询就绪标记、打印 status 校验、停止与清理。
 
 ```sh
-# 四场景全跑（交互：每个场景就绪后回车继续 / q 退出）
+# 五场景全跑（交互：每个场景就绪后回车继续 / q 退出）
 cd ~/affinitygraph
 tests/manual-scenarios.sh --db clickhouse
 
-# 只跑某个场景（0=baseline，1=无 profile 动态，2=有 profile 动态，3=静态）
+# 只跑某个场景（0=自然基线，1=无 profile 动态，2=有 profile 动态，3=静态，4=绑核基线）
 tests/manual-scenarios.sh --db clickhouse --scenario 0
 tests/manual-scenarios.sh --db clickhouse --scenario 3
+tests/manual-scenarios.sh --db clickhouse --scenario 4 --s4-cpus 8-15
+
+# 也可通过环境变量指定 S4 CPU 列表（默认 0-31）
+S4_CPUS=8-15 tests/manual-scenarios.sh --db clickhouse --scenario 4
 
 # 无人值守：就绪后自动等待 60s 再进入下一场景
 AUTO_NEXT_SECONDS=60 tests/manual-scenarios.sh --db clickhouse
@@ -511,8 +562,9 @@ tests/manual-scenarios.sh --db clickhouse --dry-run
 脚本顶部 CONFIG 块是 183 默认值，可用同名环境变量覆盖：
 `CLICKHOUSE_BIN`、`CLICKHOUSE_CONFIG`、`CLICKHOUSE_PROFILE`、
 `CLICKHOUSE_CPUS`、`CLICKHOUSE_RUN_USER`（默认 root，设空则不带 `--user`；
-数据属主非 root 时设实际用户，如 `xhc`）、`CLICKHOUSE_READY_PORT`（默认
-9004，baseline 就绪判定端口）、`CLICKHOUSE_QUIESCENCE_SECONDS`（默认 30）、`CLICKHOUSE_STATIC_SCAN_SECONDS`（默认 30）、`TARGETS_DIR`、
+数据属主非 root 时设实际用户，如 `xhc`）、`S4_CPUS`（默认 `0-31`，也可用
+命令行 `--s4-cpus CPU_LIST` 覆盖）、`CLICKHOUSE_READY_PORT`（默认 9004，
+baseline 就绪判定端口）、`CLICKHOUSE_QUIESCENCE_SECONDS`（默认 30）、`CLICKHOUSE_STATIC_SCAN_SECONDS`（默认 30）、`TARGETS_DIR`、
 `PROFILES_DIR`、`CALIBRATION_DIR`、`SUDO_ASKPASS`、`READY_TIMEOUT_SECONDS`
 等。非 root 用户运行时自动经 `SUDO_ASKPASS + sudo -A` 提权；baseline 需以
 非 root 运行数据库时自动经 `runuser -u <user>` 启动。
@@ -520,7 +572,7 @@ tests/manual-scenarios.sh --db clickhouse --dry-run
 脚本只负责启动与调度状态校验；**正式 YCSB 测量请在另一终端按第 3.5 节手动
 执行**。
 
-### 6.1 在新机器上生成 profile（换硬件）
+### 7.1 在新机器上生成 profile（换硬件）
 
 profile **不依赖具体线程数**（无 `count` 字段）：每条规则 = 线程组名白名单
 （`comm`/`comm_prefix`）+ 一个目标 CPU 集合。新机器上不需要重新观测线程数量，
@@ -557,14 +609,14 @@ sudo -A ./build/affinity-run preflight \
 
 
 
-## 7. 大表构建、NUMA 探针与正式 A/B（ClickHouse 大表 + 扫描/聚合负载）
+## 8. 大表构建、NUMA 探针与正式 A/B（ClickHouse 大表 + 扫描/聚合负载）
 
 背景：第 2/3/5 节用的是 105 MiB 小表点查（`workloada_clickhouse_numa_read`），
 服务端成本被 JDBC 客户端开销淹没，测不到 NUMA 收益。本节切换到 ≤10GB 大表 +
 扫描/聚合负载：先用受控四臂探针判定「扫描/聚合是否受 CPU 亲和性影响」（Gate），
 通过后再做正式 A/B。
 
-### 7.1 大表 usertable_big（键格式与 YCSB 逐字节一致）
+### 8.1 大表 usertable_big（键格式与 YCSB 逐字节一致）
 
 `tests/ch-bigtable-build.sh` 生成 `ycsb.usertable_big`：`YCSB_KEY String` 主键 +
 `field0..field9 String`，`MergeTree PRIMARY KEY YCSB_KEY ORDER BY YCSB_KEY
@@ -588,7 +640,7 @@ tests/ch-bigtable-build.sh --drop      # 重建（默认已存在且行数一致
   建议行数并非零退出，**不自动重建**。
 - 12M 行原始约 12GB，压缩后预计 6–9GB；超限就按提示调小 `BIG_TABLE_ROWS`。
 
-### 7.2 四臂 NUMA 探针
+### 8.2 四臂 NUMA 探针
 
 `tests/ch-numa-probe.sh` 自动跑四臂（脚本会接管 ClickHouse 生命周期：每臂
 stop→start→就绪→探针→stop，结束后恢复原启动方式）：
@@ -624,16 +676,16 @@ tests/ch-numa-probe.sh --arm C          # 只跑某一臂（排障用）
 > Q2 键界说明：`Math.abs` 使显示键折叠到 `[0, 2^63)`，键在显示空间的密度是
 > `N/2^63`，覆盖 t 行的范围长度 `L = t·2^63/N`（不是 `t·2^64/N`）。
 
-### 7.3 Gate 判定
+### 8.3 Gate 判定
 
 同一数据布局下，C（本地）vs D（远端）服务端 p50 差 ≥10% 且 p95 同向
 （Q2/Q3 任一命中即算；方向不敏感，C 更快或 D 更快都算）：
 
-- 命中 →「扫描/聚合受 CPU 亲和性影响、有研究必要」→ 进入 7.4 正式 A/B，
+- 命中 →「扫描/聚合受 CPU 亲和性影响、有研究必要」→ 进入 8.4 正式 A/B，
   最终 workload 保留 `scan=0.10`；
 - 未命中 → 输出「该负载形态无研究必要」，不加 scan（或仅 read）。
 
-### 7.4 正式 A/B（read 0.90 + scan 0.10）
+### 8.4 正式 A/B（read 0.90 + scan 0.10）
 
 workload 模板 `tests/workloads/clickhouse_numa_scan.properties`：
 `readproportion=0.90`、`scanproportion=0.10`、`scanlengthdistribution=uniform`、
@@ -661,10 +713,10 @@ WHERE event_time > now() - INTERVAL 20 MINUTE
 ```
 
 最终报告以服务端 p50 差为主口径、端到端吞吐为辅助口径。若 Gate 显示仅
-Q2/Q3 聚合敏感而 JDBC scan 形态被传输稀释，则补一轮 7.2 探针作为代表性负载
+Q2/Q3 聚合敏感而 JDBC scan 形态被传输稀释，则补一轮 8.2 探针作为代表性负载
 的正式对照（记录服务端耗时分布）。
 
-### 7.5 恢复
+### 8.5 恢复
 
 探针/正式 A/B 结束后脚本自动恢复；手动恢复（杀掉 membind/affinity-run 实例后
 用原命令重启，`SELECT 1` 轮询就绪）：
@@ -685,9 +737,9 @@ sudo -A /home/xhc/clickhouse/ClickHouse/build/programs/clickhouse client \
   --query 'DROP TABLE IF EXISTS ycsb.usertable_big'
 ```
 
-### 7.6 实测记录（183，2026-08-24）
+### 8.6 实测记录（183，2026-08-24）
 
-本节在 183 上按 7.1–7.3 实际执行一遍后的结果与注意事项（供复测对照）。
+本节在 183 上按 8.1–8.3 实际执行一遍后的结果与注意事项（供复测对照）。
 
 **建表与校验**
 
@@ -718,9 +770,9 @@ sudo -A /home/xhc/clickhouse/ClickHouse/build/programs/clickhouse client \
 
 C vs D（同为 membind，仅 CPU pin 不同）Q2/Q3 服务端 p50 差分别为
 9.9% / 6.5% / 5.8%（Q2-1M/5M/10M）与 8.1% / 7.9% / 7.1%（Q3-1M/5M/10M），
-全部 <10%，p95 也未同向显著（最大 21.9% 仅在 Q3-1M，p50 未达阈值）→ 按 7.3
+全部 <10%，p95 也未同向显著（最大 21.9% 仅在 Q3-1M，p50 未达阈值）→ 按 8.3
 判定「**该负载形态无研究必要（扫描/聚合不受显著 CPU 亲和性影响）**」，最终
-workload 不加 scan（或仅 read），7.4 的正式 A/B 与 197 客户端测量不执行。
+workload 不加 scan（或仅 read），8.4 的正式 A/B 与 197 客户端测量不执行。
 
 **183 特有注意事项（复测/换机对照）**
 
@@ -729,12 +781,12 @@ workload 不加 scan（或仅 read），7.4 的正式 A/B 与 197 客户端测�
 - CH 以非 root 用户 `xhc` 运行（数据属主 xhc）：root 直接启动报 Code: 430，
   需 `CLICKHOUSE_RUN_USER=xhc`（脚本已自动经 `runuser -u xhc --` 启动）。
 - `numactl` 不认 node 名字：membind 必须写数字，`PROBE_MEMBIND_NODE=2`。
-- 183 的 `system.query_log` 未启用（表不存在），7.4 的 query_log 服务端耗时
+- 183 的 `system.query_log` 未启用（表不存在），8.4 的 query_log 服务端耗时
   交叉验证在 183 不可用；复测若需要，先开 `log_queries` 并重启 CH。
 - Q1 p50 偏大（与 Q2/Q3 重查询混跑排队所致；空闲时点查约 0.1–0.2ms），
   Q1 不参与 Gate。Q2-10M 实际覆盖 9,801,110 行（`t>N` 时夹到 99% 键界）。
 
-## 8. 日志速查
+## 9. 日志速查
 
 ```sh
 # runtime 全量事件
@@ -748,7 +800,7 @@ sudo -A grep -E '"type":"(solve_window_end|action|action_commit|sampling_stopped
 sudo -A tail -30 /tmp/affinity-clickhouse-sN.log
 ```
 
-## 9. FAQ
+## 10. FAQ
 
 - **`--user root` 与数据属主？** ClickHouse 要求进程用户与数据目录属主一致。
   数据为 root 属主时默认 `--user root` 正确；数据为 xhc 等非 root 属主时，

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# 四场景手动测试自动化脚本（Doris / ClickHouse）
+# 五场景手动测试自动化脚本（Doris / ClickHouse）
 #
 # 用法:
-#   tests/manual-scenarios.sh --db doris|clickhouse [--scenario 0|1|2|3] [--dry-run]
+#   tests/manual-scenarios.sh --db doris|clickhouse [--scenario 0|1|2|3|4]
+#       [--s4-cpus CPU_LIST] [--dry-run]
 #
-# 四个场景:
+# 五个场景:
 #   0) baseline                  无 affinitygraph 干预, 直接启动数据库测基线吞吐
 #   1) 无 profile 文件的动态调度  mode=active, solver 自行决策
 #   2) 有 profile 文件的动态调度  profile 初始放置 + solver 增量微调
 #   3) 有 profile 文件的静态调度  profile 放置后保持, dynamic=false, 可选零采样
+#   4) pinned baseline            无 affinitygraph 干预, numactl -C 固定 CPU
 #
 # 交互: 每个场景启动并校验就绪后, 提示按回车停止当前场景并进入下一场景,
 #       输入 q 退出。设置 AUTO_NEXT_SECONDS>0 可无人值守自动推进。
@@ -31,6 +33,9 @@ CALIBRATION_DIR=${CALIBRATION_DIR:-/etc/affinitygraph/calibration}
 
 # 非 root 时的提权方式（183 的 askpass 脚本）
 SUDO_ASKPASS=${SUDO_ASKPASS:-/home/xhc/ExperScript/doris-bench/askpass.sh}
+
+# ---- S4（Doris / ClickHouse 共用的绑核基线参数） ----
+S4_CPUS=${S4_CPUS:-0-31}                         # 场景4默认固定 CPU
 
 # ---- Doris（数据目录可能是 root 属主 → 默认 --user root，可设 DORIS_RUN_USER="" 取消） ----
 DORIS_HOME=${DORIS_HOME:-/home/xhc/doris/apache-doris-2.1.2-bin-arm64}
@@ -96,7 +101,7 @@ usage() {
 }
 
 # ============ 场景参数 ============
-# 按 db+场景 返回: LOG_DIR SOCKET TOML RUN_USER CMD BASELINE_CMD READY_PORT
+# 按 db+场景 返回: LOG_DIR SOCKET TOML RUN_USER CMD BASELINE_CMD S4_CMD READY_PORT
 db_config() { # $1=db $2=scenario
   case "$1" in
     doris)
@@ -106,6 +111,7 @@ db_config() { # $1=db $2=scenario
       [ -z "$DORIS_RUN_USER" ] && RUN_USER=()
       CMD=(bash -c "$DORIS_FE_START --daemon && $DORIS_BE_START --daemon && wait")
       BASELINE_CMD=(bash -c "$DORIS_FE_START --daemon && $DORIS_BE_START --daemon")
+      S4_CMD=(numactl -C "$S4_CPUS" bash -c "$DORIS_FE_START --daemon && $DORIS_BE_START --daemon")
       READY_PORT="$DORIS_READY_PORT"
       ;;
     clickhouse)
@@ -115,6 +121,7 @@ db_config() { # $1=db $2=scenario
       [ -z "$CLICKHOUSE_RUN_USER" ] && RUN_USER=()
       CMD=("$CLICKHOUSE_BIN" server --config-file "$CLICKHOUSE_CONFIG")
       BASELINE_CMD=("$CLICKHOUSE_BIN" server --config-file "$CLICKHOUSE_CONFIG")
+      S4_CMD=(numactl -C "$S4_CPUS" "$CLICKHOUSE_BIN" server --config-file "$CLICKHOUSE_CONFIG")
       READY_PORT="$CLICKHOUSE_READY_PORT"
       ;;
   esac
@@ -288,6 +295,26 @@ launch_baseline() { # $1=db
   info "数据库进程已拉起，等待端口 $READY_PORT 就绪"
 }
 
+launch_pinned_baseline() { # $1=db
+  local db=$1
+  db_config "$db" 4
+  local log="/tmp/affinity-${db}-s4.log"
+  info "启动场景 4（$db，numactl -C $S4_CPUS，无 affinitygraph）..."
+  run_as_root rm -f "$log"
+  cleanup_leftovers "$db"
+  if ! as_root sh -c 'command -v numactl >/dev/null 2>&1'; then
+    die "场景 4 需要 numactl，但当前系统未找到 numactl"
+  fi
+  info "启动命令: ${S4_CMD[*]}"
+  if [ ${#RUN_USER[@]} -gt 0 ] && [ "${RUN_USER[1]}" != root ]; then
+    as_root nohup runuser -u "${RUN_USER[1]}" -- "${S4_CMD[@]}" > "$log" 2>&1 &
+  else
+    as_root nohup "${S4_CMD[@]}" > "$log" 2>&1 &
+  fi
+  sleep 3
+  info "数据库进程已拉起，等待端口 $READY_PORT 就绪"
+}
+
 check_marker() { # $1=db $2=scenario $3=marker
   local db=$1 n=$2 m=$3
   local log="${LOG_PREFIX}/runtime.jsonl"
@@ -311,6 +338,7 @@ required_markers() { # $1=scenario
     1) echo "runtime_start solve_window_end_any" ;;
     2) echo "profile_load_success initial_affinity_committed solve_window_end_any" ;;
     3) echo "profile_load_success initial_affinity_committed profile_static_hold sampling_stopped" ;;
+    4) echo "db_port_ready" ;;
   esac
 }
 
@@ -372,11 +400,16 @@ for k in ["effective_mode","effective_dynamic","sampling_stopped","bpf","collect
   fi
 }
 
-verify_baseline() { # $1=db
-  local db=$1
-  info "===== 场景 0 状态校验（baseline, $db） ====="
-  for m in $(required_markers 0); do
-    if check_marker "$db" 0 "$m"; then printf '  [ok] %s\n' "$m"; else printf '  [!!] %s 缺失\n' "$m"; fi
+verify_baseline() { # $1=db $2=scenario(0|4)
+  local db=$1 n=${2:-0}
+  db_config "$db" "$n"
+  if [ "$n" = 4 ]; then
+    info "===== 场景 4 状态校验（pinned baseline, $db） ====="
+  else
+    info "===== 场景 0 状态校验（baseline, $db） ====="
+  fi
+  for m in $(required_markers "$n"); do
+    if check_marker "$db" "$n" "$m"; then printf '  [ok] %s\n' "$m"; else printf '  [!!] %s 缺失\n' "$m"; fi
   done
   info "数据库进程:"
   case "$db" in
@@ -387,12 +420,39 @@ verify_baseline() { # $1=db
       as_root sh -c "pgrep -a -x clickhouse 2>/dev/null | head -3" || true
       ;;
   esac
+  if [ "$n" = 4 ]; then
+    info "S4 请求的 CPU 列表: $S4_CPUS"
+    local pids pid
+    case "$db" in
+      doris) pids=$(as_root sh -c 'pgrep -x java; pgrep -x doris_be' 2>/dev/null || true) ;;
+      clickhouse) pids=$(as_root pgrep -x clickhouse 2>/dev/null || true) ;;
+    esac
+    if [ -z "$pids" ]; then
+      warn "未发现可用于 affinity 抽查的数据库进程"
+    else
+      info "数据库进程实际 CPU affinity（taskset -pc）:"
+      for pid in $pids; do
+        if [ -d "/proc/$pid" ]; then
+          printf '  pid=%s ' "$pid"
+          as_root taskset -pc "$pid" 2>/dev/null || printf '不可读取\n'
+        fi
+      done
+    fi
+  fi
   if port_ready "$READY_PORT"; then
-    info "  [ok] 端口 $READY_PORT 可连，YCSB 可开始测量 baseline"
+    if [ "$n" = 4 ]; then
+      info "  [ok] 端口 $READY_PORT 可连，YCSB 可开始测量 S4"
+    else
+      info "  [ok] 端口 $READY_PORT 可连，YCSB 可开始测量 baseline"
+    fi
   else
     warn "  端口 $READY_PORT 未就绪"
   fi
-  info "说明: 当前无 affinitygraph 干预；在此状态执行 YCSB 获取 baseline 吞吐"
+  if [ "$n" = 4 ]; then
+    info "说明: 当前无 affinitygraph 干预，仅由 numactl -C 固定 CPU；在此状态执行 YCSB 获取 S4 吞吐"
+  else
+    info "说明: 当前无 affinitygraph 干预；在此状态执行 YCSB 获取 baseline 吞吐"
+  fi
 }
 
 stop_scenario() { # $1=db $2=scenario
@@ -442,6 +502,12 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --db) DB=$2; shift 2 ;;
     --scenario) SCENARIO=$2; shift 2 ;;
+    --s4-cpus)
+      [ $# -ge 2 ] || die "--s4-cpus 需要 CPU_LIST"
+      [ -n "$2" ] || die "--s4-cpus 不能是空值"
+      S4_CPUS=$2
+      shift 2
+      ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage ;;
     *) die "未知参数: $1（见 --help）" ;;
@@ -455,31 +521,53 @@ case "$DB" in
 esac
 
 if [ -n "$SCENARIO" ]; then
-  case "$SCENARIO" in 0|1|2|3) ;; *) die "--scenario 仅支持 0|1|2|3" ;; esac
+  case "$SCENARIO" in 0|1|2|3|4) ;; *) die "--scenario 仅支持 0|1|2|3|4" ;; esac
   SCENARIOS=$SCENARIO
 else
-  SCENARIOS="0 1 2 3"
+  SCENARIOS="0 1 2 3 4"
 fi
 
 info "数据库: $DB  场景: $SCENARIOS  dry-run=$DRY_RUN"
 for n in $SCENARIOS; do
-  if [ "$n" = 0 ]; then
-    info "######## 场景 0（baseline，无 affinitygraph 干预）########"
+  if [ "$n" = 0 ] || [ "$n" = 4 ]; then
+    if [ "$n" = 4 ]; then
+      info "######## 场景 4（pinned baseline，numactl -C $S4_CPUS）########"
+    else
+      info "######## 场景 0（baseline，无 affinitygraph 干预）########"
+    fi
     if [ "$DRY_RUN" = 1 ]; then
-      db_config "$DB" 0
-      info "baseline：不启动 affinitygraph，直接启动数据库（用于测量基线吞吐）"
-      info "启动命令: ${BASELINE_CMD[*]}"
-      if [ ${#RUN_USER[@]} -gt 0 ] && [ "${RUN_USER[1]}" != root ]; then
-        printf '  + [sudo] nohup runuser -u %s -- %s > /tmp/affinity-%s-baseline.log 2>&1 &\n' "${RUN_USER[1]}" "${BASELINE_CMD[*]}" "$DB"
+      if [ "$n" = 4 ]; then
+        db_config "$DB" 4
+        info "S4：不启动 affinitygraph，仅使用 numactl -C 固定数据库 CPU（用于测量绑核基线吞吐）"
+        info "启动命令: ${S4_CMD[*]}"
       else
-        printf '  + [sudo] nohup %s > /tmp/affinity-%s-baseline.log 2>&1 &\n' "${BASELINE_CMD[*]}" "$DB"
+        db_config "$DB" 0
+        info "baseline：不启动 affinitygraph，直接启动数据库（用于测量基线吞吐）"
+        info "启动命令: ${BASELINE_CMD[*]}"
+      fi
+      if [ ${#RUN_USER[@]} -gt 0 ] && [ "${RUN_USER[1]}" != root ]; then
+        if [ "$n" = 4 ]; then
+          printf '  + [sudo] nohup runuser -u %s -- %s > /tmp/affinity-%s-s4.log 2>&1 &\n' "${RUN_USER[1]}" "${S4_CMD[*]}" "$DB"
+        else
+          printf '  + [sudo] nohup runuser -u %s -- %s > /tmp/affinity-%s-baseline.log 2>&1 &\n' "${RUN_USER[1]}" "${BASELINE_CMD[*]}" "$DB"
+        fi
+      else
+        if [ "$n" = 4 ]; then
+          printf '  + [sudo] nohup %s > /tmp/affinity-%s-s4.log 2>&1 &\n' "${S4_CMD[*]}" "$DB"
+        else
+          printf '  + [sudo] nohup %s > /tmp/affinity-%s-baseline.log 2>&1 &\n' "${BASELINE_CMD[*]}" "$DB"
+        fi
       fi
       info "dry-run：跳过就绪等待/校验/交互"
       continue
     fi
-    launch_baseline "$DB"
-    wait_ready "$DB" 0 || true
-    verify_baseline "$DB"
+    if [ "$n" = 4 ]; then
+      launch_pinned_baseline "$DB"
+    else
+      launch_baseline "$DB"
+    fi
+    wait_ready "$DB" "$n" || true
+    verify_baseline "$DB" "$n"
     if ! user_advance; then
       info "用户选择退出，清理后结束"
       stop_baseline "$DB"

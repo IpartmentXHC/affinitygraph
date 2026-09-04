@@ -1,7 +1,7 @@
 # Doris 手动测试教程（不使用 YBA）
 
 面向**手动启动 Doris + YCSB** 的压测场景：不用 YBA 编排，直接用
-`affinity-run` 监督 Doris 进程，用 YCSB 打负载。覆盖四个场景：
+`affinity-run` 监督 Doris 进程，用 YCSB 打负载。覆盖五个场景：
 
 | 场景 | profile | 调度方式 | 预期行为 |
 | --- | --- | --- | --- |
@@ -9,12 +9,13 @@
 | 1 | 无 | 动态 | runtime 自行采样、决策并迁移线程（`mode=active` 一步闭环） |
 | 2 | 有 | 动态 | profile 先做初始放置，solver 再在其上增量微调 |
 | 3 | 有 | 静态 | profile 放置后保持不动（`dynamic=false` + 可 `sample_interval_seconds=0` 停止采样） |
+| 4 | 无 | `numactl -C` 绑核 | 数据库及子线程固定在指定 CPU 上，不启动 AffinityGraph |
 
 文中命令以 183 上的默认路径为准（`/home/xhc/...`、`/etc/affinitygraph/...`）；
-换机器时替换成你的实际路径。四场景也可用 `tests/manual-scenarios.sh` 自动跑
-（见第 6 节）。
+换机器时替换成你的实际路径。五场景也可用 `tests/manual-scenarios.sh` 自动跑
+（见第 7 节）。
 
-## 0. 前置准备（四种场景通用）
+## 0. 前置准备（五种场景的基础准备）
 
 ```sh
 # 1) 构建（make all 已包含用户态程序 + BPF 对象 build/affinitygraph.bpf.o）
@@ -42,8 +43,9 @@ sudo -A ./build/affinity-run preflight --config config/affinitygraph.toml \
   （`/home/xhc/doris/apache-doris-2.1.2-bin-arm64/{fe,be}`）是 root 属主，
   只有 root 能写；不带 `--user root` 或以非 root 启动时会报
   `unknown run user` / 目录权限错误。
-- **BPF 必须 ok**：多进程 Doris 依赖 BPF 递归跟踪 fork/exec 发现全部线程，
-  `collector.required=true` 下 `bpf: fail` 会直接拒绝启动。
+- **BPF 只适用于 S1-S3**：多进程 Doris 依赖 BPF 递归跟踪 fork/exec 发现全部线程，
+  `collector.required=true` 下 `bpf: fail` 会直接拒绝启动。S0/S4 不启动
+  `affinity-run`，不需要 BPF 或 AffinityGraph preflight。
 
 ## 1. 拓扑与关键参数（183）
 
@@ -54,14 +56,14 @@ lscpu -e=CPU,NODE,SOCKET | sort -k2 -n | less
 ```
 
 - Doris FE MySQL 协议端口：9030（YCSB JDBC 连接用）
-- 三个场景各自独立的 socket/日志目录，互不干扰：
+- S1/S2/S3 各自使用独立的 socket/日志目录，互不干扰：
   `/tmp/affinitygraph-doris-s{1,2,3}.sock`、
   `/var/log/affinitygraph-doris-s{1,2,3}/runtime.jsonl`
 
 ## 2. 场景 0：baseline（对照基线）
 
-不启动 affinitygraph，直接启动 Doris，测量无干预的基线吞吐，作为场景
-1/2/3 的对照（脚本 `tests/manual-scenarios.sh --db doris` 默认包含该场景）。
+不启动 affinitygraph，直接启动 Doris，测量无干预的自然基线吞吐，作为场景
+1/2/3/4 的对照（脚本 `tests/manual-scenarios.sh --db doris` 默认包含这些场景）。
 
 ```sh
 # 直接启动 FE/BE（等价于脚本场景 0 的命令）
@@ -478,20 +480,73 @@ sudo -A grep -E '"type":"(pause|runtime_stop)"' \
 sudo -A pkill -x java; sudo -A pkill -x doris_be
 ```
 
-## 6. 自动化脚本
+## 6. 场景 4：CPU 绑核基线（S0 的绑核版）
 
-`tests/manual-scenarios.sh` 自动完成四个场景（0=baseline，1-3=affinitygraph）：
-场景 0 直接启动数据库测基线；场景 1-3 按场景生成独立 toml、生成/选用
+S4 与 S0 使用完全相同的 Doris 启动方式和 YCSB 负载，唯一差异是在最外层
+使用 `numactl -C` 固定数据库进程的 CPU affinity。默认 CPU 列表为 `0-31`，
+也可以在启动时替换为其他合法的 Linux CPU 列表。
+
+S4 不启动 `affinity-run`，不读取 Profile，不运行动态 Solver，也不设置
+NUMA 内存绑定；它只用于测量“固定 CPU、Linux 默认调度”这一对照条件。
+
+### 6.1 启动 Doris
+
+```sh
+S4_CPUS=${S4_CPUS:-0-31}
+command -v numactl >/dev/null || { echo "缺少 numactl" >&2; exit 1; }
+
+sudo -A nohup numactl -C "$S4_CPUS" \
+  bash -c '/home/xhc/doris/apache-doris-2.1.2-bin-arm64/fe/bin/start_fe.sh --daemon \
+           && /home/xhc/doris/apache-doris-2.1.2-bin-arm64/be/bin/start_be.sh --daemon' \
+  > /tmp/affinity-doris-s4.log 2>&1 &
+```
+
+等待 FE 端口就绪：
+
+```sh
+until timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9030' 2>/dev/null; do sleep 5; done
+```
+
+检查数据库进程是否继承了 S4 的 CPU 掩码：
+
+```sh
+for pid in $(sudo -A pgrep -x java; sudo -A pgrep -x doris_be); do
+  sudo -A taskset -pc "$pid"
+done
+# 期望输出的 current affinity 与 S4_CPUS 一致，例如 0-31
+```
+
+### 6.2 YCSB 测量与停止
+
+YCSB 测量命令同 3.5 节，记录 S4 的 `[OVERALL] Throughput(ops/sec)`。
+测量结束后停止 Doris：
+
+```sh
+sudo -A pkill -x java
+sudo -A pkill -x doris_be
+```
+
+S4 的 CPU 绑定不等同于 `numactl --membind`：它约束可运行的 CPU，内存仍由
+Linux 默认 NUMA 策略分配。
+
+## 7. 自动化脚本
+
+`tests/manual-scenarios.sh` 自动完成五个场景（0/4=无 affinitygraph，1-3=affinitygraph）：
+场景 0 直接启动数据库测自然基线；场景 4 使用 `numactl -C` 测绑核基线；场景 1-3 按场景生成独立 toml、生成/选用
 profile、启动 affinity-run、轮询就绪标记、打印 status 校验、停止与清理。
 
 ```sh
-# 四场景全跑（交互：每个场景就绪后回车继续 / q 退出）
+# 五场景全跑（交互：每个场景就绪后回车继续 / q 退出）
 cd ~/affinitygraph
 tests/manual-scenarios.sh --db doris
 
-# 只跑某个场景（0=baseline，1=无 profile 动态，2=有 profile 动态，3=静态）
+# 只跑某个场景（0=自然基线，1=无 profile 动态，2=有 profile 动态，3=静态，4=绑核基线）
 tests/manual-scenarios.sh --db doris --scenario 0
 tests/manual-scenarios.sh --db doris --scenario 2
+tests/manual-scenarios.sh --db doris --scenario 4 --s4-cpus 8-15
+
+# 也可通过环境变量指定 S4 CPU 列表（默认 0-31）
+S4_CPUS=8-15 tests/manual-scenarios.sh --db doris --scenario 4
 
 # 无人值守：就绪后自动等待 60s 再进入下一场景
 AUTO_NEXT_SECONDS=60 tests/manual-scenarios.sh --db doris
@@ -503,6 +558,7 @@ tests/manual-scenarios.sh --db doris --dry-run
 脚本顶部 CONFIG 块是 183 默认值，可用同名环境变量覆盖：
 `DORIS_HOME`、`DORIS_FE_START`、`DORIS_BE_START`、`DORIS_PROFILE`、
 `DORIS_CPUS`、`DORIS_RUN_USER`（默认 root，设空则不带 `--user`）、
+`S4_CPUS`（默认 `0-31`，也可用命令行 `--s4-cpus CPU_LIST` 覆盖）、
 `DORIS_READY_PORT`（默认 9030，baseline 就绪判定端口）、
 `DORIS_QUIESCENCE_SECONDS`（默认 30）、`DORIS_STATIC_SCAN_SECONDS`（默认 30）、`TARGETS_DIR`、`PROFILES_DIR`、`CALIBRATION_DIR`、
 `SUDO_ASKPASS`、`READY_TIMEOUT_SECONDS` 等。
@@ -512,7 +568,7 @@ tests/manual-scenarios.sh --db doris --dry-run
 脚本只负责启动与调度状态校验；**正式 YCSB 测量请在另一终端按第 3.5 节手动
 执行**。
 
-### 6.1 在新机器上生成 profile（换硬件）
+### 7.1 在新机器上生成 profile（换硬件）
 
 profile **不依赖具体线程数**（无 `count` 字段）：每条规则 = 线程组名白名单
 （`comm`/`comm_prefix`）+ 一个目标 CPU 集合。新机器上不需要重新观测线程数量，
@@ -549,7 +605,7 @@ sudo -A ./build/affinity-run preflight \
 
 
 
-## 7. 日志速查
+## 8. 日志速查
 
 ```sh
 # runtime 全量事件
@@ -563,7 +619,7 @@ sudo -A grep -E '"type":"(solve_window_end|action|action_commit|sampling_stopped
 sudo -A tail -30 /tmp/affinity-doris-sN.log
 ```
 
-## 8. FAQ
+## 9. FAQ
 
 - **为什么必须 `--user root`？** 183 的 Doris 数据目录是 root 属主，FE/BE
   启动脚本需要写权限；`affinity-run --user root` 即保持 root 身份监督。
